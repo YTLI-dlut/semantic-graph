@@ -49,7 +49,7 @@ def make_cfg(scene_path):
     rgb_spec.sensor_type = habitat_sim.SensorType.COLOR
     rgb_spec.resolution = [480, 640]
     rgb_spec.position = [0.0, 0.88, 0.0]
-    rgb_spec.orientation = [0, 0.0, 0.0]
+    rgb_spec.orientation = [-0.5236, 0.0, 0.0]
     sensor_specs.append(rgb_spec)
 
     agent_cfg = habitat_sim.agent.AgentConfiguration()
