@@ -1,0 +1,26 @@
+<launch>
+    <arg name="fx" default="320.0"/>
+    <arg name="fy" default="320.0"/>
+    <arg name="cx" default="320.0"/>
+    <arg name="cy" default="240.0"/>
+
+    <arg name="max_dist" default="0.8"/> 
+    
+    <arg name="obstacle_range" default="3.0"/>
+
+    <arg name="min_height" default="0.96"/> 
+    <arg name="max_height" default="1.0"/> 
+
+    <node pkg="simple_mapper" type="mapper_node" name="simple_mapper" output="screen">
+        <param name="fx" value="$(arg fx)"/>
+        <param name="fy" value="$(arg fy)"/>
+        <param name="cx" value="$(arg cx)"/>
+        <param name="cy" value="$(arg cy)"/>
+        <param name="max_dist" value="$(arg max_dist)"/>
+        <param name="obstacle_range" value="$(arg obstacle_range)"/>
+        <param name="min_height" value="$(arg min_height)"/>
+        <param name="max_height" value="$(arg max_height)"/>
+    </node>
+
+    <node name="rviz" pkg="rviz" type="rviz" args="-d /root/catkin_ws/rviz/test.rviz" />
+</launch>

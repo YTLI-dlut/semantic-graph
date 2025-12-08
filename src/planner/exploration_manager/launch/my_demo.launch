@@ -1,0 +1,29 @@
+<launch>
+    <arg name="map_size_x" value="20.0"/>
+    <arg name="map_size_y" value="20.0"/>
+    <arg name="cx" value="320.0"/>
+    <arg name="cy" value="240.0"/>
+    <arg name="fx" value="320.0"/>
+    <arg name="fy" value="320.0"/>
+
+    <include file="$(find exploration_manager)/launch/algorithm.xml">
+        <arg name="map_size_x_" value="$(arg map_size_x)"/>
+        <arg name="map_size_y_" value="$(arg map_size_y)"/>
+        <arg name="cx_" value="$(arg cx)"/>
+        <arg name="cy_" value="$(arg cy)"/>
+        <arg name="fx_" value="$(arg fx)"/>
+        <arg name="fy_" value="$(arg fy)"/>
+        
+        <arg name="odometry_topic_" value="/habitat/odom"/>
+        <arg name="sensor_pose_topic_" value="/habitat/sensor_pose"/>
+        <arg name="depth_topic_" value="/habitat/camera_depth"/>
+    </include>
+
+    <param name="/exploration_node/map_ros/depth_filter_maxdist" value="10.0"/>
+    <param name="/exploration_node/map_ros/depth_filter_mindist" value="0.1"/>
+    
+    <param name="/exploration_node/map_ros/filter_min_height" value="0.2"/>
+    <param name="/exploration_node/map_ros/filter_max_height" value="2.0"/>
+
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find exploration_manager)/config/ApexNav.rviz" />
+</launch>

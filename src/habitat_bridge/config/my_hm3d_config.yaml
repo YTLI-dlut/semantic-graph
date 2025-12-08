@@ -1,0 +1,45 @@
+# 继承官方配置
+defaults:
+  - /benchmark/nav/objectnav:
+      - objectnav_hm3d
+  - _self_
+
+habitat:
+  # 1. 数据集路径设置
+  dataset:
+    # 指向我们刚刚下载的任务数据
+    data_path: data/datasets/objectnav/hm3d/v1/{split}/{split}.json.gz
+    # 指定场景数据的根目录
+    scenes_dir: data/scene_datasets/
+    # 选择验证集
+    split: val
+
+  # 2. 环境设置
+  environment:
+    max_episode_steps: 500
+    iterator_options:
+      cycle: true
+      
+  # 3. 机器人与传感器设置 (关键！防止地面倾斜)
+  simulator:
+    turn_angle: 30
+    forward_step_size: 0.25
+    agents:
+      main_agent:
+        radius: 0.18
+        height: 0.88
+        sim_sensors:
+          depth_sensor:
+            # 安装位置: 高度 0.88m
+            position: [0.0, 0.88, 0.0]
+            # 安装角度: 向下倾斜 30 度 (-0.5236 rad)
+            orientation: [0, 0.0, 0.0]
+            
+            min_depth: 0.0
+            max_depth: 10.0
+            normalize_depth: true
+            
+          # 如果需要 RGB，也可以在这里配置 rgb_sensor
+          rgb_sensor:
+            position: [0.0, 0.88, 0.0]
+            orientation: [0, 0.0, 0.0]

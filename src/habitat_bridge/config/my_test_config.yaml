@@ -1,0 +1,28 @@
+# 继承官方的测试配置
+defaults:
+  - /benchmark/nav/pointnav:
+      - pointnav_habitat_test
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 500
+  
+  simulator:
+    agents:
+      main_agent:
+        sim_sensors:
+          depth_sensor:
+            # --- 可以在这里覆盖默认设置 ---
+            # 这里的修改不会影响库文件，只会影响你当前运行的程序
+            
+            # 设置安装位置 (相对于底盘)
+            position: [0.0, 0.5, 0.0]
+            
+            # 设置安装角度 (弧度) [pitch, yaw, roll]
+            # 例如：向下倾斜 30 度 (-0.5236 rad)
+            orientation: [0, 0.0, 0.0]
+            
+            min_depth: 0.0
+            max_depth: 10.0
+            normalize_depth: true
