@@ -67,6 +67,7 @@ class HabitatROSPublisher:
         self.odom_pub = rospy.Publisher("/habitat/odom", Odometry, queue_size=10)
         self.pose_pub = rospy.Publisher("/habitat/sensor_pose", Odometry, queue_size=10)
         self.conf_pub = rospy.Publisher("/detector/confidence_threshold", Float64, queue_size=10, latch=True)
+        self.rgb_pub = rospy.Publisher("/habitat/camera_rgb", Image, queue_size=10)
         rospy.Subscriber("/cmd_vel", Twist, self.cmd_vel_callback, queue_size=1)
         
         self.tf_broadcaster = tf.TransformBroadcaster()
@@ -97,6 +98,30 @@ class HabitatROSPublisher:
         msg.encoding = "32FC1"; msg.is_bigendian = 0; msg.step = msg.width * 4
         msg.data = depth_normalized.tobytes()
         self.depth_pub.publish(msg)
+
+        if "rgb_sensor" in observations:
+            rgb_obs = observations["rgb_sensor"]  # 这是一个 numpy array
+            # Habitat 返回的通常是 (Height, Width, 4) 的 RGBA 数据
+            
+            rgb_msg = Image()
+            rgb_msg.header.stamp = ros_time
+            # frame_id 建议和深度图保持一致，或者使用 "camera_link"
+            rgb_msg.header.frame_id = "world" 
+            
+            rgb_msg.height = rgb_obs.shape[0]
+            rgb_msg.width = rgb_obs.shape[1]
+            
+            # 检查通道数来设置 encoding
+            if rgb_obs.shape[2] == 4:
+                rgb_msg.encoding = "rgba8"
+                rgb_msg.step = rgb_obs.shape[1] * 4
+            elif rgb_obs.shape[2] == 3:
+                rgb_msg.encoding = "rgb8"
+                rgb_msg.step = rgb_obs.shape[1] * 3
+            
+            # 转换为字节流
+            rgb_msg.data = rgb_obs.tobytes()
+            self.rgb_pub.publish(rgb_msg)
 
         # 2. 状态解算
         gps = agent_state.position
