@@ -5,48 +5,80 @@ import cv2
 from habitat_mapper import HabitatMapper 
 
 class ManualControlEnv:
-    def __init__(self, scene_path):
-        # 1. 配置仿真器
-        self.sim_cfg = self.make_cfg(scene_path)
-        self.sim = habitat_sim.Simulator(self.sim_cfg)
+    def __init__(self, dataset_config_file, scene_handle):
+        # ================= 参数配置区域 =================
+        # 1. 统一相机高度 (1.0米 是个折中值，盲区小，视野也不错)
+        self.camera_height = 1.0 
+        # 2. 地图范围
+        self.map_size = 40.0
+        # ===============================================
+
+        # 1. 启动仿真器
+        print("--- 正在启动仿真器 ---")
+        self.sim_cfg = self.make_cfg(dataset_config_file, scene_handle)
+        
+        try:
+            self.sim = habitat_sim.Simulator(self.sim_cfg)
+        except Exception as e:
+            print(f"[错误] 启动失败: {e}")
+            exit()
+
         self.agent = self.sim.initialize_agent(0)
         
-        # 2. 初始化建图器 (地图范围 80米)
-        self.mapper = HabitatMapper(map_size_meters=30.0, width=640, height=480)
+        # 2. 初始化建图器
+        self.mapper = HabitatMapper(map_size_meters=self.map_size, width=640, height=480)
         
-        # 3. 动作映射
+        # 【核心修复】将统一的高度参数传给建图器
+        # 只有这里和 sim 配置一致，地面才不会算错！
+        self.mapper.sensor_height = self.camera_height
+        
+        # 3. 按键映射
         self.key_mapping = {
             ord('w'): "move_forward",
             ord('a'): "turn_left",
             ord('d'): "turn_right",
         }
         
-        print(f"Loaded Scene: {os.path.basename(scene_path)}")
-        print("Controls: [W] Forward, [A] Left, [D] Right, [ESC] Quit")
+        print("\n=== 就绪 ===")
+        print(f"相机高度: {self.camera_height}m (已同步到建图算法)")
+        print("操作: [W/A/D] 移动, [ESC] 退出")
 
-    def make_cfg(self, scene_path):
+    def make_cfg(self, config_file, scene_id):
         sim_cfg = habitat_sim.SimulatorConfiguration()
         sim_cfg.gpu_device_id = 0
-        sim_cfg.scene_id = scene_path
+        sim_cfg.scene_dataset_config_file = config_file
+        sim_cfg.scene_id = scene_id
         sim_cfg.enable_physics = True
 
         sensor_specs = []
+        RESOLUTION = [480, 640]
         
-        # 深度相机
-        depth_spec = habitat_sim.CameraSensorSpec()
-        depth_spec.uuid = "depth_sensor"
-        depth_spec.sensor_type = habitat_sim.SensorType.DEPTH
-        depth_spec.resolution = [480, 640]
-        depth_spec.position = [0.0, 0.88, 0.0]
-        sensor_specs.append(depth_spec)
-
-        # RGB 相机
+        # 使用 self.camera_height 确保统一
+        POS = [0.0, self.camera_height, 0.0] 
+        
+        # RGB
         rgb_spec = habitat_sim.CameraSensorSpec()
         rgb_spec.uuid = "rgb_sensor"
         rgb_spec.sensor_type = habitat_sim.SensorType.COLOR
-        rgb_spec.resolution = [480, 640]
-        rgb_spec.position = [0.0, 0.88, 0.0]
+        rgb_spec.resolution = RESOLUTION
+        rgb_spec.position = POS
         sensor_specs.append(rgb_spec)
+
+        # Depth
+        depth_spec = habitat_sim.CameraSensorSpec()
+        depth_spec.uuid = "depth_sensor"
+        depth_spec.sensor_type = habitat_sim.SensorType.DEPTH
+        depth_spec.resolution = RESOLUTION
+        depth_spec.position = POS
+        sensor_specs.append(depth_spec)
+
+        # Semantic
+        sem_spec = habitat_sim.CameraSensorSpec()
+        sem_spec.uuid = "semantic_sensor"
+        sem_spec.sensor_type = habitat_sim.SensorType.SEMANTIC
+        sem_spec.resolution = RESOLUTION
+        sem_spec.position = POS
+        sensor_specs.append(sem_spec)
 
         agent_cfg = habitat_sim.agent.AgentConfiguration()
         agent_cfg.sensor_specifications = sensor_specs
@@ -59,59 +91,70 @@ class ManualControlEnv:
 
     def reset(self):
         if self.sim.pathfinder.is_loaded:
-            new_state = habitat_sim.AgentState()
-            new_state.position = self.sim.pathfinder.get_random_navigable_point()
-            import quaternion
-            angle = np.random.uniform(0, 2*np.pi)
-            axis = np.array([0, 1, 0])
-            new_state.rotation = quaternion.from_rotation_vector(angle * axis)
-            self.agent.set_state(new_state)
-        
+            self.agent.set_state(habitat_sim.AgentState(position=self.sim.pathfinder.get_random_navigable_point()))
         self.mapper.reset()
         self.update_view(self.sim.get_sensor_observations())
 
     def update_view(self, obs):
-        # 1. 获取数据
         depth = obs["depth_sensor"]
         rgb = obs["rgb_sensor"]
+        semantic = obs["semantic_sensor"].astype(np.int32)
         
-        # 2. 建图更新 (只负责计算 grid_map)
-        agent_state = self.agent.get_state()
-        self.mapper.update(depth, agent_state)
-        
-        # 3. [核心修改] 获取带红点和扇形的地图
-        # 之前这里写的是 cv2.cvtColor(..., ...)，那是错误的，因为那是自己手动转，没有调用画红点的逻辑
+        self.mapper.update(depth, self.agent.get_state())
         map_color = self.mapper.get_colored_map()
         
-        # 4. 显示
+        h, w = semantic.shape
+        center_id = semantic[h // 2, w // 2]
+        
+        # 获取语义名称
+        obj_name = "Unknown"
+        scene = self.sim.semantic_scene
+        if scene and len(scene.objects) > 0:
+            if center_id < len(scene.objects):
+                 obj = scene.objects[center_id]
+                 if obj and obj.category:
+                     obj_name = obj.category.name()
+        
+        # 语义可视化
+        np.random.seed(42) 
+        palette = np.random.randint(0, 255, (np.max(semantic)+100, 3), dtype=np.uint8)
+        palette[0] = [20, 20, 20]
+        safe_semantic = np.clip(semantic, 0, len(palette)-1)
+        sem_vis = palette[safe_semantic]
+        
         rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
-        cv2.imshow("First Person View (RGB)", rgb_bgr)
-        cv2.imshow("Top-down Map (SDF)", map_color)
+        cv2.line(rgb_bgr, (w//2-10, h//2), (w//2+10, h//2), (0, 255, 0), 2)
+        cv2.line(rgb_bgr, (w//2, h//2-10), (w//2, h//2+10), (0, 255, 0), 2)
+        cv2.putText(rgb_bgr, f"ID: {center_id} | {obj_name}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.imshow("RGB", rgb_bgr)
+        cv2.imshow("Semantic", sem_vis)
+        cv2.imshow("Map", map_color)
 
     def run(self):
         self.reset()
-        print("Ready. Focusing on map window might help key response.")
-        
         while True:
-            key = cv2.waitKey(10) & 0xFF # 增加一点延时给 OpenCV 处理窗口事件
+            k = cv2.waitKey(10) & 0xFF
+            if k == 27: break
             
-            if key == 27: 
-                break
+            action = None
+            if k == ord('w'): action = "move_forward"
+            elif k == ord('a'): action = "turn_left"
+            elif k == ord('d'): action = "turn_right"
+            
+            if action:
+                self.update_view(self.sim.step(action))
                 
-            if key in self.key_mapping:
-                action = self.key_mapping[key]
-                obs = self.sim.step(action)
-                self.update_view(obs)
-
         self.sim.close()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # 替换为你真实的场景路径
-    scene_path = "/home/iiau/createGraph_ws/data/scene_datasets/hm3d/val/00800-TEEsavR23oF/TEEsavR23oF.basis.glb"
+    CONFIG_FILE = "/home/iiau/HM3D/hm3d_unified_val/hm3d_annotated_val_basis.scene_dataset_config.json"
+    SCENE_HANDLE = "00800-TEEsavR23oF/TEEsavR23oF.basis.glb"
     
-    if os.path.exists(scene_path):
-        env = ManualControlEnv(scene_path)
+    if os.path.exists(CONFIG_FILE):
+        env = ManualControlEnv(CONFIG_FILE, SCENE_HANDLE)
         env.run()
     else:
-        print(f"Error: Scene path not found: {scene_path}")
+        print(f"错误: 找不到配置文件 {CONFIG_FILE}")
