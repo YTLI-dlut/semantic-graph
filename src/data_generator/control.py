@@ -4,10 +4,13 @@ class KeyboardController:
     def __init__(self):
         self.action_mapping = {
             ord('w'): "move_forward",
-            ord('s'): "move_backward",  # 新增后退
+            ord('s'): "move_backward",
             ord('a'): "turn_left",
             ord('d'): "turn_right",
-            27: "quit"  # ESC 键
+            ord('p'): "save_and_quit", # P 键保存并退出
+            ord('q'): "save_and_quit", # Q 键也可以
+            ord('j'): "jump", # J 键跳跃/瞬移
+            27: "quit"  # ESC 键只退出不保存
         }
 
     def get_action(self, key):

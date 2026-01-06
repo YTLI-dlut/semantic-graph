@@ -15,6 +15,8 @@ class HabitatMapper:
         self.map_size_pixels = int(map_size_meters / resolution)
         self.map_center = self.map_size_pixels // 2
         self.map_size_meters = map_size_meters
+        self.min_x = -map_size_meters / 2.0
+        self.min_z = -map_size_meters / 2.0
         
         # [地图 1] 几何地图: 127=未知, 255=空闲(White), 0=障碍(Black)
         self.grid_map = np.full((self.map_size_pixels, self.map_size_pixels), 127, dtype=np.uint8)
@@ -57,12 +59,13 @@ class HabitatMapper:
         self.last_agent_pos = None
         self.last_agent_rot = None
 
-    def update(self, depth_obs, semantic_obs, agent_state):
+    def update(self, depth_obs, semantic_obs, agent_state, check_is_floor_callback=None):
         """
         核心更新函数：同时更新几何地图和语义地图
         :param depth_obs: 深度图 (H, W)
         :param semantic_obs: 语义图 (H, W), 存储 Instance ID
         :param agent_state: 智能体状态 (包含 position, rotation)
+        :param check_is_floor_callback: (可选) 函数, 输入 instance_id 返回 bool(是否为地面)
         """
         # 1. 记录位姿用于可视化
         self.last_agent_pos = agent_state.position
@@ -99,10 +102,30 @@ class HabitatMapper:
         # 计算相对高度 (用于判断是地面还是障碍物)
         rel_height = py - pos[1]
         
-        # 判定逻辑
+        # 判定逻辑 (几何)
         is_obstacle = (rel_height > self.min_height_rel) & (rel_height < self.max_height_rel)
         is_ground = (rel_height <= self.min_height_rel) & (rel_height > -0.5)
         
+        # [NEW] 判定逻辑 (语义辅助): 如果语义说是地面，强制视为地面
+        if check_is_floor_callback is not None:
+            # 这是一个向量化操作稍微麻烦点，因为 callback 通常只能逐个查
+            # 为了效率，我们先假设 callback 比较快，或者 semantic_parser 有缓存
+            # 更好的方式是传入一个 set 或 dict，但这里为了灵活性还是用 callback 吧
+            # 我们可以先找出 unique IDs，查完后再映射回去
+            
+            unique_ids = np.unique(sem_ids_valid)
+            floor_ids = []
+            for uid in unique_ids:
+                if check_is_floor_callback(int(uid)):
+                    floor_ids.append(uid)
+            
+            # 创建一个 mask，如果 pixel 的 sem_id 在 floor_ids 里
+            is_semantic_floor = np.isin(sem_ids_valid, floor_ids)
+            
+            # 强制修正
+            is_ground[is_semantic_floor] = True
+            is_obstacle[is_semantic_floor] = False
+
         # 坐标离散化
         u = ((px / self.resolution) + self.map_center).astype(np.int32)
         v = ((pz / self.resolution) + self.map_center).astype(np.int32)
@@ -131,12 +154,12 @@ class HabitatMapper:
         if np.sum(is_obstacle) > 0:
             self.semantic_map[v[is_obstacle], u[is_obstacle]] = sem_ids_final[is_obstacle]
 
-    def get_geometric_map_colored(self):
+    def get_geometric_map_colored(self, draw_agent=True):
         """ 获取可视化的几何地图 (带智能体位置) """
         # 转为 BGR
         color_map = cv2.cvtColor(self.grid_map, cv2.COLOR_GRAY2BGR)
         
-        if self.last_agent_pos is None:
+        if not draw_agent or self.last_agent_pos is None:
             return color_map
 
         # 计算智能体在地图上的坐标
@@ -163,7 +186,7 @@ class HabitatMapper:
         
         return color_map
 
-    def get_semantic_map_colored(self):
+    def get_semantic_map_colored(self, draw_agent=True):
         """ 获取可视化的语义地图 (随机彩色) """
         # 1. 创建背景 (灰色)
         vis_map = np.full((self.map_size_pixels, self.map_size_pixels, 3), 127, dtype=np.uint8)
@@ -187,7 +210,7 @@ class HabitatMapper:
             vis_map[valid_mask] = np.stack([b, g, r], axis=-1)
             
         # 4. 绘制智能体位置 (方便对照)
-        if self.last_agent_pos is not None:
+        if draw_agent and self.last_agent_pos is not None:
             u = int((self.last_agent_pos[0] / self.resolution) + self.map_center)
             v = int((self.last_agent_pos[2] / self.resolution) + self.map_center)
             if 0 <= u < self.map_size_pixels and 0 <= v < self.map_size_pixels:
