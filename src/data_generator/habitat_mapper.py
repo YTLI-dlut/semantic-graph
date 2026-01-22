@@ -8,20 +8,26 @@ class HabitatMapper:
                  resolution=0.05,       # 分辨率 (米/像素)
                  width=640,             # 相机宽度
                  height=480,            # 相机高度
-                 fov=90):               # 视场角
+                 fov=90,                # 视场角
+                 num_classes=80):       # [NEW] 语义类别数量
         
         # === 1. 地图参数 ===
         self.resolution = resolution
         self.map_size_pixels = int(map_size_meters / resolution)
         self.map_center = self.map_size_pixels // 2
         self.map_size_meters = map_size_meters
+        self.num_classes = num_classes
+
         self.min_x = -map_size_meters / 2.0
         self.min_z = -map_size_meters / 2.0
         
         # [地图 1] 几何地图: 127=未知, 255=空闲(White), 0=障碍(Black)
         self.grid_map = np.full((self.map_size_pixels, self.map_size_pixels), 127, dtype=np.uint8)
         
-        # [地图 2] 语义地图: 存储 Instance ID, 初始化为 -1 (代表无物体/未知)
+        # [地图 2] 概率语义计数: (H, W, K) 存储置信度累积
+        self.semantic_counts = np.zeros((self.map_size_pixels, self.map_size_pixels, num_classes), dtype=np.float32)
+        
+        # [地图 2 - 缓存] 语义地图: 缓存 ArgMax 结果, 初始化为 -1
         self.semantic_map = np.full((self.map_size_pixels, self.map_size_pixels), -1, dtype=np.int32)
         
         # 可视化状态缓存
@@ -55,17 +61,19 @@ class HabitatMapper:
     def reset(self):
         """ 重置所有地图 """
         self.grid_map.fill(127)
+        self.semantic_counts.fill(0)
         self.semantic_map.fill(-1)
         self.last_agent_pos = None
         self.last_agent_rot = None
 
-    def update(self, depth_obs, semantic_obs, agent_state, check_is_floor_callback=None):
+    def update(self, depth_obs, semantic_obs, agent_state, check_is_floor_callback=None, confidence_obs=None):
         """
         核心更新函数：同时更新几何地图和语义地图
         :param depth_obs: 深度图 (H, W)
         :param semantic_obs: 语义图 (H, W), 存储 Instance ID
         :param agent_state: 智能体状态 (包含 position, rotation)
-        :param check_is_floor_callback: (可选) 函数, 输入 instance_id 返回 bool(是否为地面)
+        :param check_is_floor_callback: (可选) 函数, 输入 instance_id 返回 bool
+        :param confidence_obs: (可选) 置信度图 (H, W), 对应 semantic_obs 每个像素的置信度
         """
         # 1. 记录位姿用于可视化
         self.last_agent_pos = agent_state.position
@@ -86,9 +94,13 @@ class HabitatMapper:
         
         points_cam = np.stack([x_c, y_c, z_c], axis=1)
         
-        # [关键] 提取对应的语义 ID
-        sem_ids_valid = semantic_obs[mask] # 只取有效深度点对应的语义ID
-        
+        # [关键] 提取对应的语义 ID 和置信度
+        sem_ids_valid = semantic_obs[mask] 
+        if confidence_obs is None:
+            conf_values = np.ones_like(sem_ids_valid, dtype=np.float32)
+        else:
+            conf_values = confidence_obs[mask]
+
         # 4. 转世界坐标 (Camera -> World)
         rot_mat = quaternion.as_rotation_matrix(rot)
         points_world = points_cam @ rot_mat.T + pos
@@ -106,23 +118,15 @@ class HabitatMapper:
         is_obstacle = (rel_height > self.min_height_rel) & (rel_height < self.max_height_rel)
         is_ground = (rel_height <= self.min_height_rel) & (rel_height > -0.5)
         
-        # [NEW] 判定逻辑 (语义辅助): 如果语义说是地面，强制视为地面
+        # [NEW] 判定逻辑 (语义辅助)
         if check_is_floor_callback is not None:
-            # 这是一个向量化操作稍微麻烦点，因为 callback 通常只能逐个查
-            # 为了效率，我们先假设 callback 比较快，或者 semantic_parser 有缓存
-            # 更好的方式是传入一个 set 或 dict，但这里为了灵活性还是用 callback 吧
-            # 我们可以先找出 unique IDs，查完后再映射回去
-            
             unique_ids = np.unique(sem_ids_valid)
             floor_ids = []
             for uid in unique_ids:
                 if check_is_floor_callback(int(uid)):
                     floor_ids.append(uid)
             
-            # 创建一个 mask，如果 pixel 的 sem_id 在 floor_ids 里
             is_semantic_floor = np.isin(sem_ids_valid, floor_ids)
-            
-            # 强制修正
             is_ground[is_semantic_floor] = True
             is_obstacle[is_semantic_floor] = False
 
@@ -139,38 +143,50 @@ class HabitatMapper:
         v = v[valid_indices]
         is_obstacle = is_obstacle[valid_indices]
         is_ground = is_ground[valid_indices]
-        sem_ids_final = sem_ids_valid[valid_indices] # 保持同步
+        sem_ids_final = sem_ids_valid[valid_indices] 
+        conf_final = conf_values[valid_indices]
         
         # === 6. 更新数据 ===
         
         # [Map 1] 更新几何地图
-        # 规则：先画 Free (255)，再画 Obstacle (0) 覆盖
         self.grid_map[v[is_ground], u[is_ground]] = 255
         self.grid_map[v[is_obstacle], u[is_obstacle]] = 0
         
-        # [Map 2] 更新语义地图
-        # 规则：只记录障碍物区域的语义信息 (因为我们关心的是“那个物体是什么”)
-        # 忽略地面的语义 (通常是 floor 或 carpet)，保持地图清晰
+        # [Map 2] 更新语义概率计数
+        # 只记录障碍物区域的语义信息
         if np.sum(is_obstacle) > 0:
-            self.semantic_map[v[is_obstacle], u[is_obstacle]] = sem_ids_final[is_obstacle]
+            obs_v = v[is_obstacle]
+            obs_u = u[is_obstacle]
+            obs_ids = sem_ids_final[is_obstacle]
+            obs_conf = conf_final[is_obstacle]
+            
+            # 使用 np.add.at 进行原地累加 (Handling hash collisions/duplicates in same batch)
+            # 需要过滤无效 ID ( -1 )
+            valid_id_mask = (obs_ids >= 0) & (obs_ids < self.num_classes)
+            
+            if np.any(valid_id_mask):
+                np.add.at(self.semantic_counts, (obs_v[valid_id_mask], obs_u[valid_id_mask], obs_ids[valid_id_mask]), obs_conf[valid_id_mask])
+                
+                # 可选：更新缓存的 ArgMax Map (只更新本次变动的区域以节省时间，或按需全量计算)
+                # 这里为了简单，暂不每次都全量ArgMax，等到 get_semantic_map 时再算
+                # 或者：只更新当前观测到的区域
+                # current_max_ids = np.argmax(self.semantic_counts[obs_v, obs_u], axis=-1)
+                # self.semantic_map[obs_v, obs_u] = current_max_ids
 
     def get_geometric_map_colored(self, draw_agent=True):
         """ 获取可视化的几何地图 (带智能体位置) """
-        # 转为 BGR
         color_map = cv2.cvtColor(self.grid_map, cv2.COLOR_GRAY2BGR)
         
         if not draw_agent or self.last_agent_pos is None:
             return color_map
 
-        # 计算智能体在地图上的坐标
         u_agent = int((self.last_agent_pos[0] / self.resolution) + self.map_center)
         v_agent = int((self.last_agent_pos[2] / self.resolution) + self.map_center)
         
-        # 越界保护
         if not (0 <= u_agent < self.map_size_pixels and 0 <= v_agent < self.map_size_pixels):
             return color_map
 
-        # 绘制视野扇形 (半透明)
+        # 绘制视野扇形
         overlay = color_map.copy()
         rot_mat = quaternion.as_rotation_matrix(self.last_agent_rot)
         forward = rot_mat @ np.array([0, 0, -1])
@@ -180,36 +196,39 @@ class HabitatMapper:
         cv2.ellipse(overlay, (u_agent, v_agent), (radius, radius), 
                     angle_deg, -self.fov/2, self.fov/2, (0, 255, 255), -1)
         cv2.addWeighted(overlay, 0.4, color_map, 0.6, 0, color_map)
-        
-        # 绘制红色位置点
         cv2.circle(color_map, (u_agent, v_agent), 5, (0, 0, 255), -1)
         
         return color_map
 
     def get_semantic_map_colored(self, draw_agent=True):
-        """ 获取可视化的语义地图 (随机彩色) """
-        # 1. 创建背景 (灰色)
+        """ 获取可视化的语义地图 (根据概率分布 ArgMax) """
+        # 1. 实时计算 ArgMax
+        # 注意：为了性能，如果地图巨大，这一步会慢。
+        # 优化：只计算被观测过的区域 (sum > 0)
+        
+        total_counts = np.sum(self.semantic_counts, axis=-1)
+        observed_mask = total_counts > 0
+        
         vis_map = np.full((self.map_size_pixels, self.map_size_pixels, 3), 127, dtype=np.uint8)
         
-        # 2. 绘制 Free 区域 (白色) - 基于几何地图
+        # 2. 绘制 Free 区域 (白色)
         vis_map[self.grid_map == 255] = [255, 255, 255]
         
-        # 3. 绘制语义物体
-        # 提取所有有效的语义像素 (ID != -1)
-        valid_mask = self.semantic_map > -1
-        ids = self.semantic_map[valid_mask]
-        
-        if len(ids) > 0:
-            # 使用 Hash 算法生成伪随机颜色，保证同一个 ID 颜色永远固定
-            # 公式: (ID * Prime + Offset) % 255
+        # 3. 绘制语义物体 (仅在有观测的地方)
+        if np.any(observed_mask):
+            # 获取最大概率的 ID
+            best_ids = np.argmax(self.semantic_counts, axis=-1)
+            
+            ids = best_ids[observed_mask]
+            
+            # 伪彩色
             r = (ids * 13 + 50) % 255
             g = (ids * 47 + 80) % 255
             b = (ids * 101 + 110) % 255
             
-            # 填色 (OpenCV 使用 BGR 顺序)
-            vis_map[valid_mask] = np.stack([b, g, r], axis=-1)
+            vis_map[observed_mask] = np.stack([b, g, r], axis=-1)
             
-        # 4. 绘制智能体位置 (方便对照)
+        # 4. 绘制智能体
         if draw_agent and self.last_agent_pos is not None:
             u = int((self.last_agent_pos[0] / self.resolution) + self.map_center)
             v = int((self.last_agent_pos[2] / self.resolution) + self.map_center)
@@ -217,3 +236,31 @@ class HabitatMapper:
                 cv2.circle(vis_map, (u, v), 5, (0, 0, 255), -1)
 
         return vis_map
+
+    def get_entropy_map_colored(self):
+        """ 计算并可视化熵地图 (热力图) """
+        # H = - sum(p * log(p))
+        epsilon = 1e-6
+        
+        total_counts = np.sum(self.semantic_counts, axis=-1, keepdims=True)
+        valid_mask = (total_counts > 0).squeeze()
+        
+        entropy_map = np.zeros((self.map_size_pixels, self.map_size_pixels), dtype=np.float32)
+        
+        if np.any(valid_mask):
+            probs = self.semantic_counts[valid_mask] / (total_counts[valid_mask] + epsilon)
+            entropy = -np.sum(probs * np.log2(probs + epsilon), axis=-1)
+            entropy_map[valid_mask] = entropy
+            
+        # 归一化用于可视化 (0 - MaxEntropy)
+        # MaxEntropy 对于 N 类是 log2(N)
+        max_entropy = np.log2(self.num_classes) if self.num_classes > 1 else 1.0
+        norm_entropy = (entropy_map / max_entropy * 255).astype(np.uint8)
+        
+        # 应用热力图颜色映射 (Jet: Blue=Low, Red=High)
+        heatmap = cv2.applyColorMap(norm_entropy, cv2.COLORMAP_JET)
+        
+        # 背景设为黑色或灰色以免混淆
+        # heatmap[~valid_mask] = [0, 0, 0] # 已经是0了
+        
+        return heatmap
