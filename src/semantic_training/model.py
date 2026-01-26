@@ -229,6 +229,14 @@ class PolicyNet(nn.Module):
         # self.prev_action_encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
 
         self.pointer = SingleHeadAttention(embedding_dim)
+        
+        # Orientation Head (Discrete 8 directions)
+        # 0: 0°, 1: 45°, 2: 90°, ..., 7: 315°
+        self.orientation_head = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim // 2),
+            nn.ReLU(),
+            nn.Linear(embedding_dim // 2, 8) # 8 class logits
+        )
 
     def encode_graph(self, node_inputs, node_padding_mask, edge_mask, utility_mask):
         node_feature = self.initial_embedding(node_inputs)
@@ -265,6 +273,9 @@ class PolicyNet(nn.Module):
         enhanced_current_node_feature, decoder_attention = self.decoder(current_node_feature, enhanced_node_feature, node_padding_mask)
         enhanced_current_node_feature = self.current_embedding(torch.cat((enhanced_current_node_feature, current_node_feature), dim=-1))
         
+        # Calculate Orientation Logits (Batch, 8)
+        orientation_logits = self.orientation_head(enhanced_current_node_feature).squeeze(1)
+
         if return_attention_weights:
             logp, pointer_attention = self.pointer(enhanced_current_node_feature, neigboring_feature, current_mask, return_attention_weights=True)
             logp = logp.squeeze(1) # batch_size*k_size
@@ -273,11 +284,11 @@ class PolicyNet(nn.Module):
                 'decoder_attention': decoder_attention,  # n_heads*batch_size*1*n_nodes
                 'node_importance': pointer_attention.squeeze(1).mean(dim=0)  # k_size, 平均注意力作为节点重要性
             }
-            return logp, attention_info
+            return logp, orientation_logits, attention_info
         else:
             logp = self.pointer(enhanced_current_node_feature, neigboring_feature, current_mask)
             logp = logp.squeeze(1) # batch_size*k_size
-            return logp
+            return logp, orientation_logits
 
 
 
@@ -286,11 +297,11 @@ class PolicyNet(nn.Module):
         enhanced_node_feature = self.encode_graph(node_inputs, node_padding_mask, edge_mask, utility_mask)
         
         if return_attention_weights:
-            logp, attention_info = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, return_attention_weights=True)
-            return logp, attention_info
+            logp, orientation_logits, attention_info = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, return_attention_weights=True)
+            return logp, orientation_logits, attention_info
         else:
-            logp = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy)
-            return logp
+            logp, orientation_logits = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy)
+            return logp, orientation_logits
 
 
 class QNet(nn.Module):
@@ -306,7 +317,7 @@ class QNet(nn.Module):
             self.robot_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
         self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
 
-        self.q_values_layer = nn.Linear(embedding_dim, 1)
+        self.q_values_layer = nn.Linear(embedding_dim, 8)
 
     def encode_graph(self, node_inputs, node_padding_mask, edge_mask, utility_mask):
         embedding_feature = self.initial_embedding(node_inputs)
@@ -350,8 +361,10 @@ class QNet(nn.Module):
         
         #assert 0 in current_mask
         current_mask = current_mask.permute(0, 2, 1)
-        zero = torch.zeros_like(q_values).to(q_values.device)
-        q_values = torch.where(current_mask == 1, zero, q_values)
+        # Use a large negative number for invalid actions instead of 0
+        # to avoid selecting them when Q-values are negative (e.g. penalties)
+        min_value = torch.tensor(-1e9).to(q_values.device)
+        q_values = torch.where(current_mask == 1, min_value, q_values)
 
         return q_values, attention_weights
 

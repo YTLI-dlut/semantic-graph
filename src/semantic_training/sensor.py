@@ -30,7 +30,7 @@ def collision_check(x0, y0, x1, y1, ground_truth, robot_belief):
         if x == x1 and y == y1:
             break
 
-        robot_belief.itemset((int(y), int(x)), k)
+        robot_belief[int(y), int(x)] = k
 
         if error > 0:
             x += x_inc
@@ -42,16 +42,26 @@ def collision_check(x0, y0, x1, y1, ground_truth, robot_belief):
     return robot_belief
 
 
-def sensor_work(robot_position, sensor_range, robot_belief, ground_truth):
+def sensor_work(robot_position, sensor_range, robot_belief, ground_truth, robot_orientation=0, fov=None):
     robot_belief_ = np.copy(robot_belief)
     sensor_angle_inc = 0.5 / 180 * np.pi
-    sensor_angle = 0
+    
     x0 = robot_position[0]
     y0 = robot_position[1]
-    while sensor_angle < 2 * np.pi:
+    
+    if fov is None:
+        # Full 360 degree scan (backward compatibility)
+        start_angle = 0
+        end_angle = 2 * np.pi
+    else:
+        # Limited FOV scan
+        start_angle = robot_orientation - fov / 2
+        end_angle = robot_orientation + fov / 2
+        
+    sensor_angle = start_angle
+    while sensor_angle < end_angle:
         x1 = x0 + np.cos(sensor_angle) * sensor_range
         y1 = y0 + np.sin(sensor_angle) * sensor_range
         robot_belief_ = collision_check(x0, y0, x1, y1, ground_truth, robot_belief_)
-        # print(f"Angle: {sensor_angle}, x0: {x0}, y0: {y0}, x1: {x1}, y1: {y1}") # Debug
         sensor_angle += sensor_angle_inc
     return robot_belief_

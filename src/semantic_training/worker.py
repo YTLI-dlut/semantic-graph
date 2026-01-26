@@ -1,15 +1,17 @@
 
 import copy
 import os
-import imageio
+import imageio.v2 as imageio
+import shutil
 import numpy as np
 import torch
 from env import Env
 from parameter import *
 import time
+from astar_utils import astar
 
 class Worker:
-    def __init__(self, meta_agent_id, policy_net, q_net, global_step, device='cuda', greedy=False, save_image=False):
+    def __init__(self, meta_agent_id, policy_net, q_net, global_step, device='cuda', greedy=False, save_image=False, save_path=None):
         self.device = device
         self.greedy = greedy
         self.metaAgentID = meta_agent_id
@@ -17,10 +19,20 @@ class Worker:
         self.node_padding_size = NODE_PADDING_SIZE
         self.k_size = K_SIZE
         self.save_image = save_image
+        self.save_path = save_path if save_path else gifs_path
 
         self.env = Env(map_index=self.global_step, k_size=self.k_size, plot=save_image)
         self.local_policy_net = policy_net
         self.local_q_net = q_net
+        
+        # Exploration State
+        self.current_frontier_target = None
+        self.current_path = None
+        self.target_replan_timer = 0
+        self.blacklisted_frontiers = [] # List of (coords, expiry_step)
+        self.position_history = [] # For oscillation detection
+
+
 
         self.episode_buffer = []
         self.perf_metrics = dict()
@@ -65,7 +77,10 @@ class Worker:
         
         node_utility = node_utility.reshape((n_nodes, 1))
         
-        node_inputs = np.concatenate((node_coords, node_utility, guidepost), axis=1)
+        # New Features: Entropy & Unconfirmed Object Vector
+        entropy_feats, vector_feats = self.env.get_node_features(self.env.node_coords)
+        
+        node_inputs = np.concatenate((node_coords, node_utility, guidepost, entropy_feats, vector_feats), axis=1)
         node_inputs = torch.FloatTensor(node_inputs).unsqueeze(0).to(self.device)
 
         # Padding nodes
@@ -119,19 +134,265 @@ class Worker:
         observations = node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, edge_mask # Using edge_mask as utility_mask for now
         return observations
 
-    def select_node(self, observations):
+    def select_node(self, observations, curr_episode):
         node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask = observations
-        with torch.no_grad():
-            logp_list = self.local_policy_net(node_inputs, edge_inputs, current_index, node_padding_mask,
-                                              edge_padding_mask, edge_mask, utility_mask, self.greedy)
-        if self.greedy:
-            action_index = torch.argmax(logp_list, dim=1).long()
+        
+        # Random Exploration Phase
+        if curr_episode < RANDOM_EXPLORE_EPOCHS:
+            action_index = None
+            orientation_idx = None
+
+            # --- A* Frontier Exploration Logic ---
+            if USE_ASTAR_EXPLORATION:
+                # 0. Manage Blacklist
+                current_step = self.global_step if hasattr(self, 'global_step') else time.time() # Fallback if global_step static
+                # Actually global_step in worker is passed in init, might not update. Use time or local counter?
+                # Let's use time for simplicity in this context or just a counter.
+                # Since worker is re-created or persistent? It seems persistent.
+                # We can use a local step counter if global_step isn't updating per step here.
+                if not hasattr(self, 'internal_step_counter'):
+                    self.internal_step_counter = 0
+                self.internal_step_counter += 1
+                
+                self.blacklisted_frontiers = [x for x in self.blacklisted_frontiers if x[1] > self.internal_step_counter]
+
+                # Oscillation Detection
+                self.position_history.append(self.env.robot_position)
+                if len(self.position_history) > 10:
+                    self.position_history.pop(0)
+                
+                # Check for A-B-A pattern
+                is_oscillating = False
+                if len(self.position_history) >= 4:
+                    # Check if pos[t] ~= pos[t-2] and pos[t-1] ~= pos[t-3]
+                    p_curr = self.position_history[-1]
+                    p_prev = self.position_history[-2]
+                    p_prev2 = self.position_history[-3]
+                    p_prev3 = self.position_history[-4]
+                    
+                    if np.linalg.norm(p_curr - p_prev2) < 2.0 and np.linalg.norm(p_prev - p_prev3) < 2.0:
+                         is_oscillating = True
+                
+                if is_oscillating and self.current_frontier_target is not None:
+                    # Blacklist current target
+                    self.blacklisted_frontiers.append((self.current_frontier_target, self.internal_step_counter + 100))
+                    self.current_frontier_target = None
+                    self.current_path = None
+                    self.position_history = [] # Reset history
+
+                # 1. Update Target Logic with Hysteresis & Blacklisting
+                dist_to_target = float('inf')
+                
+                # Check if current target is still valid
+                target_valid = False
+                if self.current_frontier_target is not None:
+                    dist_to_target = np.linalg.norm(self.env.robot_position - self.current_frontier_target)
+                    # Check if target is still in frontiers list (approximate match)
+                    if len(self.env.frontiers) > 0:
+                        dists_to_frontiers = np.linalg.norm(self.env.frontiers - self.current_frontier_target, axis=1)
+                        if np.min(dists_to_frontiers) < 5.0: 
+                            target_valid = True
+                
+                if not target_valid:
+                    self.current_frontier_target = None
+                    self.current_path = None
+                
+                # Check if reached (Close enough)
+                # If we are close to target (e.g. < 10.0), we assume we visited it.
+                # If it's still a frontier, it means we couldn't clear it (unreachable or sensor noise).
+                # Blacklist it to prevent immediate re-selection.
+                if self.current_frontier_target is not None and dist_to_target < 15.0:
+                    self.blacklisted_frontiers.append((self.current_frontier_target, self.internal_step_counter + 50)) # Blacklist for 50 steps
+                    self.current_frontier_target = None
+                    self.current_path = None
+                
+                # Re-select target if None
+                if self.current_frontier_target is None:
+                     if len(self.env.frontiers) > 0:
+                        # Filter out blacklisted
+                        candidate_indices = []
+                        for i, f in enumerate(self.env.frontiers):
+                            is_blacklisted = False
+                            for b_coords, _ in self.blacklisted_frontiers:
+                                if np.linalg.norm(f - b_coords) < 5.0:
+                                    is_blacklisted = True
+                                    break
+                            if not is_blacklisted:
+                                candidate_indices.append(i)
+                        
+                        if len(candidate_indices) > 0:
+                            candidates = self.env.frontiers[candidate_indices]
+                            dists = np.linalg.norm(candidates - self.env.robot_position, axis=1)
+                            min_idx = np.argmin(dists)
+                            self.current_frontier_target = candidates[min_idx]
+                        else:
+                            # If all blacklisted, just pick nearest of all
+                            dists = np.linalg.norm(self.env.frontiers - self.env.robot_position, axis=1)
+                            min_idx = np.argmin(dists)
+                            self.current_frontier_target = self.env.frontiers[min_idx]
+                            
+                        self.current_path = None 
+                     else:
+                        self.current_frontier_target = None
+                        self.current_path = None
+                
+                # 2. Plan Path (with caching)
+                if self.current_frontier_target is not None:
+                    # Only re-plan if no path or path finished/invalid
+                    need_replan = False
+                    if self.current_path is None or len(self.current_path) == 0:
+                        need_replan = True
+                    else:
+                        # Check if robot has deviated too far from path start (re-plan if so)
+                        # Or if path is blocked (check only next few steps for performance)
+                        # For now, let's just use the cached path and prune it based on current pos
+                        pass
+
+                    if need_replan:
+                        # Prepare Map: 1=Obstacle, 0=Free
+                        grid_map = (self.env.robot_belief == 1).astype(int)
+                        
+                        start_pos = (int(self.env.robot_position[1]), int(self.env.robot_position[0])) # y, x
+                        end_pos = (int(self.current_frontier_target[1]), int(self.current_frontier_target[0])) # y, x
+                        
+                        path = astar(grid_map, start_pos, end_pos)
+                        
+                        if path is None:
+                            # Path planning failed (unreachable?), reset target to force re-selection
+                            self.current_frontier_target = None
+                            self.current_path = None
+                        else:
+                            self.current_path = path
+
+                    # 3. Follow Path (Lookahead)
+                    if self.current_path is not None and len(self.current_path) > 0:
+                        # Prune path: remove points that are "behind" us or too close
+                        # Find closest point on path to robot
+                        path_arr = np.array(self.current_path) # (N, 2) -> (y, x)
+                        # Convert to (x, y) for distance calc
+                        path_xy = np.fliplr(path_arr) 
+                        dists = np.linalg.norm(path_xy - self.env.robot_position, axis=1)
+                        min_dist_idx = np.argmin(dists)
+                        
+                        # Update current path to start from closest point
+                        # But keep some history? No, just slice.
+                        self.current_path = self.current_path[min_dist_idx:]
+                        
+                        # Lookahead
+                        lookahead_dist = 30.0 # Lookahead distance
+                        target_point = self.current_path[-1] # Default to end
+                        
+                        for i, pt in enumerate(self.current_path):
+                             pt_xy = np.array([pt[1], pt[0]])
+                             dist = np.linalg.norm(pt_xy - self.env.robot_position)
+                             if dist > lookahead_dist:
+                                 target_point = pt
+                                 break
+                        
+                        target_xy = np.array([target_point[1], target_point[0]])
+                        
+                        # 4. Select Action
+                        valid_mask = (edge_padding_mask == 0).squeeze()
+                        valid_indices = torch.nonzero(valid_mask).flatten()
+                        
+                        best_score = float('inf')
+                        best_idx = None
+                        
+                        if len(valid_indices) > 0:
+                            curr_node_idx_val = current_index.item()
+                            for idx in valid_indices:
+                                n_global_idx = edge_inputs[0, 0, idx].item()
+                                if n_global_idx == -1: continue
+                                if n_global_idx == curr_node_idx_val: continue # Skip self
+                                
+                                n_pos = self.env.node_coords[n_global_idx]
+                                score = np.linalg.norm(n_pos - target_xy)
+                                
+                                if score < best_score:
+                                    best_score = score
+                                    best_idx = idx
+                            
+                            if best_idx is not None:
+                                # Local Minima Check
+                                current_dist_to_lookahead = np.linalg.norm(self.env.robot_position - target_xy)
+                                if best_score >= current_dist_to_lookahead:
+                                     # Moving moves us further away or same dist
+                                     if current_dist_to_lookahead < 20.0:
+                                         # We are close to lookahead (which might be target)
+                                         # Consider target reached/stuck
+                                         if self.current_frontier_target is not None:
+                                             self.blacklisted_frontiers.append((self.current_frontier_target, self.internal_step_counter + 50))
+                                             self.current_frontier_target = None
+                                             self.current_path = None
+                                         # Stay
+                                         # Find action index for self or 0
+                                         # But we need to return valid action.
+                                         # If we return best_idx, we oscillate.
+                                         # If we reset target, next loop handles it.
+                                         pass
+                                     else:
+                                         # Far from target but stuck. Re-plan.
+                                         self.current_path = None
+
+                                action_index = best_idx.unsqueeze(0)
+                                n_global_idx = edge_inputs[0, 0, best_idx].item()
+                                n_pos = self.env.node_coords[n_global_idx]
+                                dx = n_pos[0] - self.env.robot_position[0]
+                                dy = n_pos[1] - self.env.robot_position[1]
+                                angle = np.arctan2(dy, dx) 
+                                if angle < 0: angle += 2*np.pi
+                                ori_discrete = int(round(angle / (np.pi/4))) % 8
+                                orientation_idx = torch.tensor([ori_discrete]).to(self.device)
+
+            if action_index is None:
+                # Fallback to Random
+                valid_mask = (edge_padding_mask == 0).squeeze() # (k_size)
+                valid_indices = torch.nonzero(valid_mask).flatten()
+                
+                # Filter out self-loop in fallback
+                curr_node_idx_val = current_index.item()
+                filtered_indices = []
+                for idx in valid_indices:
+                     n_global_idx = edge_inputs[0, 0, idx].item()
+                     if n_global_idx != -1 and n_global_idx != curr_node_idx_val:
+                         filtered_indices.append(idx)
+                
+                if len(filtered_indices) > 0:
+                    idx = torch.randint(0, len(filtered_indices), (1,)).item()
+                    action_index = filtered_indices[idx].unsqueeze(0) 
+                else:
+                    # If absolutely no other choice, stay (or 0 if 0 is valid)
+                    if len(valid_indices) > 0:
+                         action_index = valid_indices[0].unsqueeze(0)
+                    else:
+                         action_index = torch.tensor([0]).to(self.device)
+
+                # Random Orientation (Discrete 0-7)
+                orientation_idx = torch.randint(0, 8, (1,)).to(self.device)
+            
         else:
-            action_index = torch.multinomial(logp_list.exp(), 1).long().squeeze(1)
+            # Model Prediction Phase
+            with torch.no_grad():
+                logp_list, orientation_logits = self.local_policy_net(node_inputs, edge_inputs, current_index, node_padding_mask,
+                                                  edge_padding_mask, edge_mask, utility_mask, self.greedy)
+            
+            if self.greedy:
+                action_index = torch.argmax(logp_list, dim=1).long()
+                orientation_idx = torch.argmax(orientation_logits, dim=1).long()
+            else:
+                action_index = torch.multinomial(logp_list.exp(), 1).long().squeeze(1)
+                # Sample from orientation logits
+                orientation_probs = torch.softmax(orientation_logits, dim=1)
+                orientation_idx = torch.multinomial(orientation_probs, 1).long().squeeze(1)
         
         next_node_index = edge_inputs[0, 0, action_index]
         next_position = self.env.node_coords[next_node_index]
-        return next_position, action_index
+        
+        # Convert orientation index [0-7] to radians [0, 2pi)
+        # 0 -> 0, 1 -> pi/4, 2 -> pi/2, ...
+        target_orientation = orientation_idx.item() * (np.pi / 4.0)
+        
+        return next_position, action_index, target_orientation, orientation_idx
 
     # ... save/load buffer ...
     def save_observations(self, observations):
@@ -144,8 +405,16 @@ class Worker:
         self.episode_buffer[5] += copy.deepcopy(edge_mask).bool()
         self.episode_buffer[15] += copy.deepcopy(utility_mask).bool()
 
-    def save_action(self, action_index):
+    def save_action(self, action_index, orientation_idx):
         self.episode_buffer[6] += action_index.unsqueeze(0).unsqueeze(0)
+        # Save orientation action (assume slot 16 or new one? buffer size is 17)
+        # buffer[15] and [16] were utility mask and next utility mask
+        # We need a new slot. Let's extend buffer size in __init__?
+        # Or reuse. Let's append to a new list. But episode_buffer is a list of lists.
+        # Let's add slot 17 for orientation.
+        if len(self.episode_buffer) < 18:
+            self.episode_buffer.append([]) # 17: orientation action
+        self.episode_buffer[17] += orientation_idx.unsqueeze(0).unsqueeze(0)
 
     def save_reward_done(self, reward, done):
         self.episode_buffer[7] += copy.deepcopy(torch.FloatTensor([[[reward]]]).to(self.device))
@@ -164,27 +433,65 @@ class Worker:
     def run_episode(self, curr_episode):
         done = False
         self.total_semantic_gain = 0
-        max_steps = 128 
+        max_steps = MAX_EPISODE_STEPS
+        self.current_frontier_target = None # Reset exploration target
         
+        # Log Phase
+        if curr_episode < RANDOM_EXPLORE_EPOCHS:
+            phase_str = "Random Exploration"
+        else:
+            phase_str = "Model Prediction"
+            
+        print(f"Agent {self.metaAgentID} | Episode {curr_episode} | Phase: {phase_str}")
+
         for i in range(max_steps):
             # Single Agent: No loop over robots
             observations = self.get_observations()
             self.save_observations(observations)
             
-            next_position, action_index = self.select_node(observations)
-            self.save_action(action_index)
+            next_position, action_index, target_orientation, orientation_idx = self.select_node(observations, curr_episode)
+            self.save_action(action_index, orientation_idx)
             
-            new_semantics_count, dist = self.env.step(next_position)
+            # Record State for Penalty
+            prev_pos = self.env.robot_position.copy()
+            prev_ori = self.env.robot_orientation
+            
+            new_semantics_count, dist = self.env.step(next_position, target_orientation)
             
             # Update graph (using safe map internal to env)
             self.env.update_graph()
 
             reward_explore = self.env.calculate_reward(dist)
-            reward_semantic = new_semantics_count * 5.0
-            total_reward = reward_explore + reward_semantic
-            self.total_semantic_gain += new_semantics_count
+            reward_semantic = new_semantics_count * REWARD_CONFIRM
             
+            # Penalty Logic
+            penalty = 0.0
+            # Check if stayed still (Position close AND Orientation close)
+            dist_moved = np.linalg.norm(self.env.robot_position - prev_pos)
+            ori_diff = abs(self.env.robot_orientation - prev_ori)
+            ori_diff = min(ori_diff, 2*np.pi - ori_diff) # Cyclic diff
+            
+            if dist_moved < 1e-3 and ori_diff < 1e-3:
+                penalty = STAY_STILL_PENALTY
+                # print(f"Ep {curr_episode} Step {i}: Penalty Triggered! Reward += {penalty}")
+
             done = self.env.check_done()
+            reward_done = REWARD_DONE if done else 0.0
+
+            total_reward = reward_explore + reward_semantic + penalty + reward_done + REWARD_STEP_PENALTY
+            self.total_semantic_gain += new_semantics_count
+
+            if self.save_image:
+                 path = f'{self.save_path}/episode_{curr_episode}'
+                 info_text = f"步骤: {i} | 回合: {curr_episode}\n"
+                 info_text += f"阶段: {phase_str}\n"
+                 info_text += f"总奖励: {total_reward:.2f} (探索: {reward_explore:.2f}, 语义: {reward_semantic:.2f}, 惩罚: {penalty:.2f}, 完成: {reward_done:.2f})\n"
+                 info_text += f"已确认: {len(self.env.found_semantics)} | 已发现: {len(self.env.seen_semantics)}\n"
+                 ori_deg = np.degrees(target_orientation)
+                 ori_idx = orientation_idx.item()
+                 info_text += f"动作: 移动->Node{action_index.item()} | 角度->Idx{ori_idx}({ori_deg:.1f}°)"
+                 self.env.plot_env(self.global_step, path, i, info_text=info_text)
+            
             self.save_reward_done(total_reward, done)
             
             observations = self.get_observations() # Next state
@@ -199,9 +506,52 @@ class Worker:
         self.perf_metrics['success_rate'] = done
         self.perf_metrics['total_steps'] = i
         self.perf_metrics['semantic_gain'] = self.total_semantic_gain
+        
+        # Detailed Rewards & State Metrics
+        self.perf_metrics['reward_explore'] = self.env.last_rewards.get('explore', 0)
+        # self.perf_metrics['reward_entropy'] = self.env.last_rewards.get('entropy', 0) # Removed
+        self.perf_metrics['reward_discovery'] = self.env.last_rewards.get('discovery', 0)
+        self.perf_metrics['reward_semantic'] = self.total_semantic_gain * REWARD_CONFIRM # Approx
+        self.perf_metrics['reward_penalty'] = penalty # Last step penalty
+        self.perf_metrics['reward_repeat'] = self.env.last_rewards.get('repeat', 0)
+
+        
+        self.perf_metrics['state_entropy'] = np.sum(self.env.entropy_map)
+        self.perf_metrics['state_frontiers'] = len(self.env.frontiers)
+        self.perf_metrics['state_confirmed'] = len(self.env.found_semantics)
+        self.perf_metrics['state_unconfirmed'] = len(self.env.get_unconfirmed_centers())
+
+        if self.save_image:
+             self.make_gif(curr_episode)
 
     def work(self, currEpisode):
         self.run_episode(currEpisode)
+
+    def make_gif(self, episode):
+        # Read all images from the folder
+        # Path: gifs/FOLDER_NAME/episode_{episode}_step_{step}.png
+        # But wait, env.plot_env saves to f'{path}/step_{step_idx:04d}.png'
+        # In runner.py: worker = Worker(..., save_image=True/False)
+        # In worker.py: self.env = Env(..., plot=save_image)
+        # We need to pass the save path to env.plot_env or handle it here.
+        # Currently env.plot_env is called? No, it's not called in run_episode yet!
+        # We need to call env.plot_env in run_episode if save_image is True.
+        
+        path = f'{self.save_path}/episode_{episode}'
+        images = []
+        if not os.path.exists(path):
+            return
+
+        file_names = sorted((fn for fn in os.listdir(path) if fn.endswith('.png')))
+        for filename in file_names:
+            images.append(imageio.imread(os.path.join(path, filename)))
+            
+        if len(images) > 0:
+            imageio.mimsave(f'{self.save_path}/episode_{episode}.gif', images, duration=0.1)
+            # Optional: Clean up images
+            if os.path.exists(path):
+                shutil.rmtree(path)
+
 
     def calculate_edge_mask(self, edge_inputs):
         size = len(edge_inputs)

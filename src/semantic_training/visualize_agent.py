@@ -1,6 +1,6 @@
 
 import os
-import imageio
+import imageio.v2 as imageio
 import glob
 import numpy as np
 import torch
@@ -11,7 +11,8 @@ from parameter import *
 
 def make_gif(path, duration, filename="agent_movement.gif"):
     images = []
-    filenames = sorted(glob.glob(os.path.join(path, '*.png')))
+    # Only select step_*.png files to avoid mixing with ground_truth.png which has different dimensions
+    filenames = sorted(glob.glob(os.path.join(path, 'step_*.png')))
     for filename_png in filenames:
         images.append(imageio.imread(filename_png))
     
@@ -19,8 +20,11 @@ def make_gif(path, duration, filename="agent_movement.gif"):
         os.makedirs('gifs')
         
     output_path = os.path.join('gifs', filename)
-    imageio.mimsave(output_path, images, duration=duration)
-    print(f"GIF saved to {output_path}")
+    if len(images) > 0:
+        imageio.mimsave(output_path, images, duration=duration)
+        print(f"GIF saved to {output_path}")
+    else:
+        print("No images found to create GIF.")
 
 def main():
     # Setup
@@ -43,11 +47,25 @@ def main():
         
     policy_net = PolicyNet(input_dim, EMBEDDING_DIM).to(device)
     
-    # Check for saved model
-    # model_path defined in parameter.py
-    # if os.path.exists(f'{model_path}/policy_0.pth'):
-    #     policy_net.load_state_dict(torch.load(f'{model_path}/policy_0.pth'))
-    #     print("Loaded saved model.")
+    # Try to load latest model
+    model_dirs = sorted(glob.glob('model_save/semantic_*'))
+    if len(model_dirs) > 0:
+        latest_dir = model_dirs[-1]
+        print(f"Found latest model dir: {latest_dir}")
+        # Sort by episode number (policy_100.pth)
+        try:
+            policies = sorted(glob.glob(os.path.join(latest_dir, 'policy_*.pth')), 
+                            key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            if len(policies) > 0:
+                latest_policy = policies[-1]
+                print(f"Loading model: {latest_policy}")
+                policy_net.load_state_dict(torch.load(latest_policy, map_location=device))
+            else:
+                print("No policy files found in latest dir.")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+    else:
+        print("No model_save directories found. Using random weights.")
     
     print("Starting Simulation...")
     max_steps = 128
@@ -91,16 +109,21 @@ def main():
             observations = worker.get_observations()
             
             # Select Action
-            next_position, action_index = worker.select_node(observations)
+            # Pass curr_episode for exploration strategy (e.g. 99999 for model prediction if trained)
+            # using episode_attempt as proxy or just large number if we want model output
+            next_position, action_index, target_orientation, orientation_idx = worker.select_node(observations, 99999)
             
             # Step Env
-            env.step(next_position)
+            env.step(next_position, target_orientation)
             
             # Update Graph
             env.update_graph()
             
             # Plot
-            env.plot_env(f"attempt_{episode_attempt}", current_save_path, i)
+            ori_deg = np.degrees(target_orientation)
+            ori_idx = orientation_idx.item()
+            info_text = f"Step: {i} | Ori: {ori_deg:.1f} (Idx {ori_idx})"
+            env.plot_env(f"attempt_{episode_attempt}", current_save_path, i, info_text=info_text)
             step_count += 1
             
             # Check Done
