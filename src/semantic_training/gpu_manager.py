@@ -96,8 +96,11 @@ class GPUMemoryManager:
                 return func(*args, **kwargs)
             except RuntimeError as e:
                 if 'out of memory' in str(e):
-                    print("OOM Detected! Clearing cache and skipping step.")
-                    torch.cuda.empty_cache()
+                    print(f"OOM Detected in {func.__name__}! Clearing cache and skipping step.")
+                    try:
+                        torch.cuda.empty_cache()
+                    except RuntimeError as clean_error:
+                        print(f"Warning: Failed to clear cache: {clean_error}")
                     return None
                 else:
                     raise e

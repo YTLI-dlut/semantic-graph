@@ -217,10 +217,10 @@ class Graph_generator:
         return result
 
     def generate_uniform_points(self):
-        x = np.linspace(0, self.map_x - 1, 32).round().astype(int) # 30
-        y = np.linspace(0, self.map_y - 1, 32).round().astype(int)
-        # x = np.linspace(0, self.map_x - 1, 25).round().astype(int) # 30
-        # y = np.linspace(0, self.map_y - 1, 25).round().astype(int)
+        # x = np.linspace(0, self.map_x - 1, 32).round().astype(int) # 30
+        # y = np.linspace(0, self.map_y - 1, 32).round().astype(int)
+        x = np.linspace(0, self.map_x - 1, 25).round().astype(int) # 30
+        y = np.linspace(0, self.map_y - 1, 25).round().astype(int)
         t1, t2 = np.meshgrid(x, y)
         points = np.vstack([t1.T.ravel(), t2.T.ravel()]).T
         return points

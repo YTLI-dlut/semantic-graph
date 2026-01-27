@@ -4,29 +4,33 @@ import os
 # MAME Parameter Configuration (Single Agent Refactor)
 
 REPLAY_SIZE = 10000
-MINIMUM_BUFFER_SIZE = 2000
-BATCH_SIZE = 64
+MINIMUM_BUFFER_SIZE = 10000
+BATCH_SIZE = 32
 EMBEDDING_DIM = 128
 
 NODE_PADDING_SIZE = 500  
-K_SIZE = 20  
+# Action Space
+K_SIZE = 15  
+NUM_ANGLES_BIN = 36
+NUM_HEADING_CANDIDATES = 3
 
 USE_GPU = True  
 USE_GPU_GLOBAL = True
 NUM_GPU = 2
-NUM_META_AGENT = 12 
+NUM_META_AGENT = 16 
 
-LR = 1e-5
-GAMMA = 0.99
+LR = 3e-4
+GAMMA = 1
 DECAY_STEP = 256
 SUMMARY_WINDOW = 5
-LOAD_MODEL = False 
+LOAD_MODEL = False
+LOAD_MODEL_PATH = '/home/iiau/createGraph_ws/model_save/semantic_20260126_215244/sac_checkpoint_2100.pth'
 SAVE_IMG_GAP = 100
 
 # Training Control
 RANDOM_EXPLORE_EPOCHS = 50
 USE_ASTAR_EXPLORATION = True # Use A* based frontier exploration in early epochs
-MAX_EPISODE_STEPS = 256
+MAX_EPISODE_STEPS = 350
 STAY_STILL_PENALTY = -0.500
 
 # Single Agent Settings
@@ -64,7 +68,7 @@ REWARD_REPEAT_PENALTY = -0.5
 # SAC Parameters
 TAU = 0.005
 ALPHA = 0.2
-TARGET_ENTROPY_SCALE = 0.98
+TARGET_ENTROPY_SCALE = 0.2
 
 # GPU Load Balancing
 ENABLE_GPU_BALANCING = True

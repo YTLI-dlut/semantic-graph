@@ -53,16 +53,37 @@ def main():
     global_target_q_net2.eval()
     
     # 3. Entropy Parameter (Alpha)
-    # Target Entropy adjusted for Joint Action Space (K_SIZE * 8 orientations)
-    target_entropy = -np.log(1.0 / (K_SIZE * 8)) * TARGET_ENTROPY_SCALE
+    # Target Entropy adjusted for Joint Action Space (K_SIZE * NUM_HEADING_CANDIDATES)
+    target_entropy = -np.log(1.0 / (K_SIZE * NUM_HEADING_CANDIDATES)) * TARGET_ENTROPY_SCALE
     log_alpha = torch.zeros(1, requires_grad=True, device=device)
     log_alpha.data[:] = np.log(ALPHA)
     
-    # 4. Optimizers
+    # Optimizers
     policy_optimizer = optim.Adam(global_policy_net.parameters(), lr=LR)
     q_optimizer1 = optim.Adam(global_q_net1.parameters(), lr=LR)
     q_optimizer2 = optim.Adam(global_q_net2.parameters(), lr=LR)
     alpha_optimizer = optim.Adam([log_alpha], lr=LR)
+
+    # Load Model
+    curr_episode = 0
+    if LOAD_MODEL and LOAD_MODEL_PATH and os.path.exists(LOAD_MODEL_PATH):
+        print(f"Loading checkpoint from {LOAD_MODEL_PATH}...")
+        checkpoint = torch.load(LOAD_MODEL_PATH)
+        global_policy_net.load_state_dict(checkpoint['policy_model'])
+        global_q_net1.load_state_dict(checkpoint['q_net1_model'])
+        global_q_net2.load_state_dict(checkpoint['q_net2_model'])
+        log_alpha.data = checkpoint['log_alpha'].data
+        policy_optimizer.load_state_dict(checkpoint['policy_optimizer'])
+        q_optimizer1.load_state_dict(checkpoint['q_optimizer1'])
+        q_optimizer2.load_state_dict(checkpoint['q_optimizer2'])
+        alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
+        
+        try:
+            start_episode = int(LOAD_MODEL_PATH.split('_')[-1].split('.')[0])
+            curr_episode = start_episode
+            print(f"Resuming from episode {curr_episode}")
+        except ValueError:
+            print("Could not parse episode number from filename, starting from 0")
 
     # Ray
     ray.init()
@@ -74,8 +95,6 @@ def main():
     weights_set.append(global_q_net1.state_dict())
 
     # Training Loop
-    curr_episode = 0
-    
     # Experience Replay Buffer
     experience_buffer = [] 
     for _ in range(30): # Reserve enough slots
@@ -126,6 +145,9 @@ def main():
                     if len(job_results) > 17:
                         experience_buffer[17].append(job_results[17][i]) # ori
                     
+                    if len(job_results) > 18:
+                        experience_buffer[18].append(job_results[18][i]) # best_headings
+
                     # Next State (Explicitly saved in worker.py)
                     experience_buffer[20].append(job_results[9][i])
                     experience_buffer[21].append(job_results[10][i])
@@ -134,6 +156,9 @@ def main():
                     experience_buffer[24].append(job_results[13][i])
                     experience_buffer[25].append(job_results[14][i])
                     experience_buffer[26].append(job_results[16][i])
+                    
+                    if len(job_results) > 19:
+                        experience_buffer[27].append(job_results[19][i]) # next_best_headings
 
             # Trim Buffer
             if len(experience_buffer[0]) > REPLAY_SIZE:
@@ -175,6 +200,7 @@ def main():
                     b_reward = torch.stack([experience_buffer[7][j] for j in indices]).to(device)
                     b_done = torch.stack([experience_buffer[8][j] for j in indices]).to(device)
                     b_util = torch.stack([experience_buffer[15][j] for j in indices]).to(device)
+                    b_best_headings = torch.stack([experience_buffer[18][j] for j in indices]).to(device)
                     
                     b_next_node = torch.stack([experience_buffer[20][j] for j in indices]).to(device)
                     b_next_edge = torch.stack([experience_buffer[21][j] for j in indices]).to(device)
@@ -183,7 +209,7 @@ def main():
                     b_next_edge_pad = torch.stack([experience_buffer[24][j] for j in indices]).to(device)
                     b_next_edge_mask = torch.stack([experience_buffer[25][j] for j in indices]).to(device)
                     b_next_util = torch.stack([experience_buffer[26][j] for j in indices]).to(device)
-                    b_ori = torch.stack([experience_buffer[17][j] for j in indices]).to(device)
+                    b_next_best_headings = torch.stack([experience_buffer[27][j] for j in indices]).to(device)
                     
                     # Devices
                     dev_p = device_map['policy']
@@ -194,58 +220,57 @@ def main():
                     with torch.no_grad():
                         alpha = log_alpha.exp()
                         # Policy on dev_p
-                        next_logp_list, next_ori_logits, _ = global_policy_net(
+                        next_logp_list, _, _ = global_policy_net(
                             b_next_node.to(dev_p), b_next_edge.to(dev_p), b_next_curr.to(dev_p), 
                             b_next_node_pad.to(dev_p), b_next_edge_pad.to(dev_p), b_next_edge_mask.to(dev_p), b_next_util.to(dev_p),
+                            neighbor_best_headings=b_next_best_headings.to(dev_p),
                             return_attention_weights=True
                         )
                         next_logp_list = next_logp_list.to(device)
-                        next_ori_logits = next_ori_logits.to(device)
+                        next_probs = next_logp_list.exp()
+                        next_log_probs = next_logp_list
 
-                        next_node_probs = next_logp_list.exp()
-                        next_ori_probs = torch.softmax(next_ori_logits, dim=-1)
-                        next_ori_log_probs = torch.log_softmax(next_ori_logits, dim=-1)
-
-                        # Joint Probabilities (Broadcasting) -> (B, K, 8)
-                        P_joint = next_node_probs.unsqueeze(2) * next_ori_probs.unsqueeze(1)
-                        log_P_joint = next_logp_list.unsqueeze(2) + next_ori_log_probs.unsqueeze(1)
-                        
                         # Target Q1 on dev_q1 (primary)
-                        target_q1_val, _ = global_target_q_net1(b_next_node, b_next_edge, b_next_curr, b_next_node_pad, b_next_edge_pad, b_next_edge_mask, b_next_util)
+                        target_q1_val, _ = global_target_q_net1(
+                            b_next_node, b_next_edge, b_next_curr, b_next_node_pad, b_next_edge_pad, b_next_edge_mask, b_next_util,
+                            neighbor_best_headings=b_next_best_headings
+                        )
                         
                         # Target Q2 on dev_q2
                         target_q2_val, _ = global_target_q_net2(
                             b_next_node.to(dev_q2), b_next_edge.to(dev_q2), b_next_curr.to(dev_q2), 
-                            b_next_node_pad.to(dev_q2), b_next_edge_pad.to(dev_q2), b_next_edge_mask.to(dev_q2), b_next_util.to(dev_q2)
+                            b_next_node_pad.to(dev_q2), b_next_edge_pad.to(dev_q2), b_next_edge_mask.to(dev_q2), b_next_util.to(dev_q2),
+                            neighbor_best_headings=b_next_best_headings.to(dev_q2)
                         )
                         target_q2_val = target_q2_val.to(device) # Bring back to primary
                         
-                        # Q values are now (B, K, 8)
                         target_q_min = torch.min(target_q1_val, target_q2_val)
                         
-                        next_v = (P_joint * (target_q_min - alpha * log_P_joint)).sum(dim=[1, 2], keepdim=True)
+                        next_v = (next_probs * (target_q_min - alpha * next_log_probs)).sum(dim=1, keepdim=True)
                         target_q = b_reward + GAMMA * (1 - b_done) * next_v
                     
                     # Current Q1 on dev_q1
-                    current_q1_val, _ = global_q_net1(b_node, b_edge, b_curr, b_node_pad, b_edge_pad, b_edge_mask, b_util)
+                    current_q1_val, _ = global_q_net1(
+                        b_node, b_edge, b_curr, b_node_pad, b_edge_pad, b_edge_mask, b_util,
+                        neighbor_best_headings=b_best_headings
+                    )
                     
                     # Current Q2 on dev_q2
                     current_q2_val, _ = global_q_net2(
                         b_node.to(dev_q2), b_edge.to(dev_q2), b_curr.to(dev_q2), 
-                        b_node_pad.to(dev_q2), b_edge_pad.to(dev_q2), b_edge_mask.to(dev_q2), b_util.to(dev_q2)
+                        b_node_pad.to(dev_q2), b_edge_pad.to(dev_q2), b_edge_mask.to(dev_q2), b_util.to(dev_q2),
+                        neighbor_best_headings=b_best_headings.to(dev_q2)
                     )
                     
-                    # Gather Q1: (B, K, 8) -> Select K -> Select 8
-                    q1_k = torch.gather(current_q1_val, 1, b_action.view(-1, 1, 1).expand(-1, -1, 8))
-                    current_q1 = torch.gather(q1_k, 2, b_ori.view(-1, 1, 1)).squeeze(-1)
+                    # Gather Q1
+                    current_q1 = torch.gather(current_q1_val, 1, b_action.squeeze(-1)).squeeze(-1)
                     
-                    # Gather Q2 (on dev_q2)
-                    q2_k = torch.gather(current_q2_val, 1, b_action.to(dev_q2).view(-1, 1, 1).expand(-1, -1, 8))
-                    current_q2 = torch.gather(q2_k, 2, b_ori.to(dev_q2).view(-1, 1, 1)).squeeze(-1)
+                    # Gather Q2 (on dev_q2 then move, or move val then gather)
+                    # current_q2_val is on dev_q2. b_action needs to be on dev_q2.
+                    current_q2 = torch.gather(current_q2_val, 1, b_action.to(dev_q2).squeeze(-1)).squeeze(-1)
                     
                     # Calculate loss on primary device (dev_q1)
-                    # We move current_q2 to dev_q1.
-                    loss_q = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2.to(device), target_q)
+                    loss_q = nn.MSELoss()(current_q1, target_q.squeeze(-1)) + nn.MSELoss()(current_q2.to(device), target_q.squeeze(-1))
                     
                     q_optimizer1.zero_grad()
                     q_optimizer2.zero_grad()
@@ -254,32 +279,32 @@ def main():
                     q_optimizer2.step()
                     
                     # 2. Policy Update
-                    logp_list, ori_logits, _ = global_policy_net(
+                    logp_list, _, _ = global_policy_net(
                         b_node.to(dev_p), b_edge.to(dev_p), b_curr.to(dev_p), 
                         b_node_pad.to(dev_p), b_edge_pad.to(dev_p), b_edge_mask.to(dev_p), b_util.to(dev_p), 
+                        neighbor_best_headings=b_best_headings.to(dev_p),
                         return_attention_weights=True
                     )
-                    node_probs = logp_list.exp()
-                    ori_probs = torch.softmax(ori_logits, dim=-1)
-                    ori_log_probs = torch.log_softmax(ori_logits, dim=-1)
-                    
-                    P_joint = node_probs.unsqueeze(2) * ori_probs.unsqueeze(1)
-                    log_P_joint = logp_list.unsqueeze(2) + ori_log_probs.unsqueeze(1)
+                    probs = logp_list.exp()
                     
                     with torch.no_grad():
-                        q1_val, _ = global_q_net1(b_node, b_edge, b_curr, b_node_pad, b_edge_pad, b_edge_mask, b_util)
+                        q1_val, _ = global_q_net1(
+                            b_node, b_edge, b_curr, b_node_pad, b_edge_pad, b_edge_mask, b_util,
+                            neighbor_best_headings=b_best_headings
+                        )
                         
                         q2_val, _ = global_q_net2(
                             b_node.to(dev_q2), b_edge.to(dev_q2), b_curr.to(dev_q2), 
-                            b_node_pad.to(dev_q2), b_edge_pad.to(dev_q2), b_edge_mask.to(dev_q2), b_util.to(dev_q2)
+                            b_node_pad.to(dev_q2), b_edge_pad.to(dev_q2), b_edge_mask.to(dev_q2), b_util.to(dev_q2),
+                            neighbor_best_headings=b_best_headings.to(dev_q2)
                         )
                         q2_val = q2_val.to(device)
                         
-                        min_q = torch.min(q1_val, q2_val) # (B, K, 8)
+                        min_q = torch.min(q1_val, q2_val)
                     
                     # Policy Loss on dev_p
-                    # Sum over K and 8
-                    loss_policy = (P_joint * (alpha.to(dev_p) * log_P_joint - min_q.to(dev_p))).sum(dim=[1, 2]).mean()
+                    # Move components to dev_p
+                    loss_policy = (probs.to(dev_p) * (alpha.to(dev_p) * logp_list - min_q.to(dev_p))).sum(dim=1).mean()
                     
                     policy_optimizer.zero_grad()
                     loss_policy.backward()
@@ -287,10 +312,10 @@ def main():
                     
                     # 3. Alpha Update
                     with torch.no_grad():
-                        entropy = -(P_joint * log_P_joint).sum(dim=[1, 2]).mean()
+                        entropy = -(probs * logp_list).sum(dim=1).mean()
                     
                     # Alpha is on device (primary)
-                    loss_alpha = -(log_alpha * (entropy.to(device) - target_entropy).detach())
+                    loss_alpha = (log_alpha * (entropy.to(device) - target_entropy).detach())
                     
                     alpha_optimizer.zero_grad()
                     loss_alpha.backward()

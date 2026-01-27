@@ -37,9 +37,6 @@ class Env():
         self.fov = np.radians(120)   # 120 degrees
         self.robot_belief = np.full(self.map_size, 127, dtype=np.uint8)
         
-        # Entropy Map
-        self.entropy_map = np.full(self.map_size, 1.0, dtype=np.float32) # Max entropy normalized to 1.0
-        
         # Graph Generator
         # sensor_range: 3.5m / 0.05 resolution = 70 pixels
         self.sensor_range = 70 
@@ -172,126 +169,6 @@ class Env():
         p_angle[~mask_fov] = 0
         p_recog = p_dist * p_angle
         
-        # --- Single Map Mask-based Entropy Update ---
-        
-        # 1. Generate Masks
-        # mask_free: Free space (255)
-        mask_free = (self.robot_belief == 255)
-        
-        # mask_high_entropy: Entropy > 0
-        mask_high_entropy = (self.entropy_map > 0)
-        
-        # mask_interest: Near Unconfirmed Objects or Frontiers
-        mask_interest = np.zeros(self.map_size, dtype=bool)
-        
-        unconfirmed = self.get_unconfirmed_centers()
-        # Frontiers as list of coords
-        frontiers_list = list(self.frontiers) if len(self.frontiers) > 0 else []
-        
-        # Draw circles for interest regions (Efficient approximation of sensor range check)
-        # Using cv2 for speed on bool mask? No, cv2 needs uint8.
-        temp_mask = np.zeros(self.map_size, dtype=np.uint8)
-        
-        # Targets: Unconfirmed + Frontiers
-        targets = []
-        if len(unconfirmed) > 0:
-            targets.extend(unconfirmed)
-        if len(frontiers_list) > 0:
-            targets.extend(frontiers_list)
-            
-        for target in targets:
-            # Draw filled circle
-            # ENTROPY_BOOST_RADIUS from parameter.py (e.g., 30)
-            # Use max(sensor_range, boost_radius) or just sensor_range?
-            # User said "sensor range of unconfirmed objects". 
-            # self.sensor_range is 70.
-            cv2.circle(temp_mask, (int(target[0]), int(target[1])), self.sensor_range, 1, -1)
-            
-        mask_interest = (temp_mask == 1)
-        
-        # update_mask = Free & (HighEntropy | Interest)
-        update_mask = mask_free & (mask_high_entropy | mask_interest)
-        
-        # 2. Apply Updates
-        
-        # A. Observation Decay (Local)
-        # Apply only where observed AND in update_mask
-        # Note: mask_observed is local window coordinates. update_mask is global.
-        # Need to slice update_mask to local window
-        local_update_mask = update_mask[y_min:y_max, x_min:x_max]
-        local_entropy = self.entropy_map[y_min:y_max, x_min:x_max]
-        
-        # Intersection of Observed and Update Candidate
-        mask_decay = mask_observed & local_update_mask
-        
-        if np.any(mask_decay):
-            learning_rate = 0.5
-            entropy_reduction = p_recog * learning_rate
-            local_entropy[mask_decay] *= (1 - entropy_reduction[mask_decay])
-            
-        # Write back decayed entropy to map (needed before Boost step if we want to combine, 
-        # but Boost is global. Let's write back first)
-        self.entropy_map[y_min:y_max, x_min:x_max] = local_entropy
-        
-        # B. Interest Boost (Global)
-        # Apply to all pixels in mask_interest & update_mask (Global coords)
-        # For efficiency, we can just iterate the targets again and update their ROIs directly,
-        # masking with mask_free.
-        
-        # However, we must ensure we don't overwrite the Decay we just did if it overlaps?
-        # User logic: "Interest" implies high entropy. 
-        # If Robot is observing it, Decay fights Boost.
-        # Order: Decay then Boost? Or Boost then Decay?
-        # If Boost sets to MAX, and Decay reduces it. 
-        # If we do Boost AFTER Decay, the area under robot will stay High if it's an interest zone.
-        # This effectively means "Agent cannot reduce entropy of interest zone until confirmed".
-        # This seems correct for "Attraction".
-        
-        # Boost Value
-        boost_val = ENTROPY_UNCONFIRMED_BOOST # e.g. 2.0. Map is 0.0-1.0 usually? 
-        # Initial entropy is 1.0. Boost 2.0 is very high.
-        # If we just set it: entropy = max(entropy, boost_val)
-        
-        # Optimization: Only iterate targets, don't update full map mask
-        for target in targets:
-            cx, cy = int(target[0]), int(target[1])
-            r_boost = self.sensor_range
-            
-            x1, x2 = max(0, cx - r_boost), min(self.map_size[1], cx + r_boost)
-            y1, y2 = max(0, cy - r_boost), min(self.map_size[0], cy + r_boost)
-            
-            # ROI slices
-            roi_entropy = self.entropy_map[y1:y2, x1:x2]
-            roi_free = mask_free[y1:y2, x1:x2]
-            
-            # Create circular mask for this ROI
-            h_roi, w_roi = roi_entropy.shape
-            Y_roi, X_roi = np.ogrid[:h_roi, :w_roi]
-            dist_sq_roi = (X_roi - (cx - x1))**2 + (Y_roi - (cy - y1))**2
-            mask_roi_circle = dist_sq_roi <= r_boost**2
-            
-            # Update Mask for this ROI: Free & Circle
-            mask_roi_update = roi_free & mask_roi_circle
-            
-            # Apply Boost
-            # Linear decay boost? "Calculate their entropy".
-            # Old logic: boost += 2.0 * (1 - dist/r).
-            # Here we set value directly? 
-            # Let's use: entropy = max(entropy, 1.0 + boost_val * (1 - dist/r))
-            # Or just simplified max(entropy, boost_val)?
-            # User said "Calculate...". Let's use distance based boost for better gradient.
-            
-            if np.any(mask_roi_update):
-                dist_roi = np.sqrt(dist_sq_roi[mask_roi_update])
-                # Boost formula: 1.0 (Base Max) + Boost * (1 - d/r)
-                # This ensures it's > 1.0 near center.
-                boosted_values = 1.0 + ENTROPY_UNCONFIRMED_BOOST * (1 - dist_roi / r_boost)
-                
-                # Apply max
-                roi_entropy[mask_roi_update] = np.maximum(roi_entropy[mask_roi_update], boosted_values)
-                self.entropy_map[y1:y2, x1:x2] = roi_entropy
-
-        
         for uid in visible_ids:
             if uid > 0 and uid not in self.found_semantics:
                 obj_mask = (local_sem == uid) & mask_observed
@@ -381,32 +258,168 @@ class Env():
                  valid_centroids.append(centroids[i])
         return valid_centroids
 
+    def get_frontier_centers(self):
+        """
+        Cluster frontiers and return their centers.
+        Reuses mask logic from get_frontier_in_map.
+        """
+        map_data = self.robot_belief
+        free_mask = (map_data == 255).astype(np.uint8)
+        kernel = np.ones((3,3), np.uint8)
+        dilated = cv2.dilate(free_mask, kernel)
+        
+        unknown_mask = (map_data == 127)
+        frontier_mask = ((dilated == 1) & unknown_mask).astype(np.uint8)
+        
+        # Connected Components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(frontier_mask, connectivity=8)
+        
+        valid_centroids = []
+        # Filter small noise
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] > 3: # Min area threshold
+                 valid_centroids.append(centroids[i])
+        
+        return valid_centroids
+
+    def check_line_of_sight(self, start, end):
+        """
+        Strict Raycast using Bresenham's line algorithm via graph_generator.check_collision
+        Returns True if line is completely FREE (255).
+        """
+        # check_collision returns True if COLLISION (i.e., NOT FREE).
+        # So we want check_collision to return False.
+        # Ensure start and end are tuples or arrays
+        is_blocked = self.graph_generator.check_collision(start, end, self.robot_belief)
+        return not is_blocked
+
+    def check_line_of_sight_to_object(self, start, end, threshold=10.0):
+        """
+        Permissive Raycast for Objects.
+        Allows the ray to hit non-free pixels (Obstacle/Unknown) IF they are close to the target.
+        This accounts for the fact that object centers are often inside the object (which is an obstacle).
+        """
+        x0, y0 = int(round(start[0])), int(round(start[1]))
+        x1, y1 = int(round(end[0])), int(round(end[1]))
+        
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        x, y = x0, y0
+        
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        
+        err = dx - dy
+        
+        while True:
+            # Check bounds
+            if not (0 <= x < self.map_size[1] and 0 <= y < self.map_size[0]):
+                return False
+                
+            val = self.robot_belief[y, x]
+            
+            # If not Free (255), check proximity to target
+            if val != 255:
+                dist_to_target = math.sqrt((x - x1)**2 + (y - y1)**2)
+                if dist_to_target <= threshold:
+                    return True # Hit the object (success)
+                else:
+                    return False # Blocked by something else too far from target
+            
+            if x == x1 and y == y1:
+                return True
+                
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+
     def get_node_features(self, node_coords):
-        # 1. Entropy Feature
-        # Optimization: Directly sample from the updated global entropy_map
-        # The entropy_map now includes both exploration entropy and unconfirmed object boosts
+        # 1. On-Demand Entropy Feature Calculation
         entropy_feats = []
-        r = 15 
-        h, w = self.map_size
+        
+        # Preprocessing: Get Targets
+        frontier_centers = self.get_frontier_centers()
+        unconfirmed_centers = self.get_unconfirmed_centers()
+        
+        # Convert to numpy for vector operations if not already
+        frontier_centers = np.array(frontier_centers)
+        unconfirmed_centers = np.array(unconfirmed_centers)
+        
+        r_sensor = self.sensor_range
         
         for coord in node_coords:
-             cx, cy = int(coord[0]), int(coord[1])
-             x1, x2 = max(0, cx-r), min(w, cx+r)
-             y1, y2 = max(0, cy-r), min(h, cy+r)
-             local_ent = self.entropy_map[y1:y2, x1:x2]
-             
-             avg_entropy = 0.0
-             if local_ent.size > 0:
-                 avg_entropy = np.mean(local_ent)
-             
-             entropy_feats.append(avg_entropy)
-             
+            score = 0.0
+            
+            # --- A. Frontier Bonus (0.5) ---
+            if len(frontier_centers) > 0:
+                # 1. Filter by Distance (Euclidean)
+                dists = np.linalg.norm(frontier_centers - coord, axis=1)
+                candidates = frontier_centers[dists <= r_sensor]
+                
+                # 2. Strict Raycast on Candidates
+                for target in candidates:
+                    if self.check_line_of_sight(coord, target):
+                        score += 0.5
+                        break # Found one visible frontier, add bonus and stop
+            
+            # --- B. Object Bonus (0.3 - 0.8 Decay) ---
+            # Rule: Entropy is inversely proportional to distance from unconfirmed object.
+            # - Max Value: 0.8 (at distance ~ 0)
+            # - Min Value: 0.3 (at distance = sensor_range)
+            # - Decay Function: Linear Decay
+            # - Formula: Score = 0.8 - (0.5 * (dist / r_sensor))
+            # - Superposition: If also frontier, add 0.5, cap at 1.0.
+
+            obj_score = 0.0
+            if len(unconfirmed_centers) > 0:
+                # 1. Calculate distances to all unconfirmed centers
+                dists = np.linalg.norm(unconfirmed_centers - coord, axis=1)
+                
+                # 2. Find candidates within sensor range
+                valid_mask = dists <= r_sensor
+                valid_indices = np.where(valid_mask)[0]
+                
+                if len(valid_indices) > 0:
+                    # 3. Sort by distance (Nearest first to maximize score potential)
+                    # We want to use the nearest visible object's distance for the score.
+                    sorted_indices = valid_indices[np.argsort(dists[valid_indices])]
+                    
+                    for idx in sorted_indices:
+                        target = unconfirmed_centers[idx]
+                        d = dists[idx]
+                        
+                        # 4. Check Visibility
+                        if self.check_line_of_sight_to_object(coord, target):
+                            # 5. Calculate Linear Decay Score
+                            # range [0, r_sensor] -> [0.8, 0.3]
+                            # ratio = d / r_sensor (0.0 to 1.0)
+                            ratio = d / r_sensor
+                            obj_score = 0.8 - (0.5 * ratio)
+                            
+                            # Safety clamp (though logic ensures ratio <= 1.0)
+                            obj_score = max(0.3, min(0.8, obj_score))
+                            
+                            break # Use the score from the nearest visible object
+            
+            # Combine Scores
+            score += obj_score
+
+            
+            # --- C. Clamping ---
+            final_score = min(score, 1.0)
+            entropy_feats.append(final_score)
+        
         entropy_feats = np.array(entropy_feats).reshape(-1, 1)
         
         # 2. Unconfirmed Object Vector
         unconfirmed_centers = self.get_unconfirmed_centers()
         vector_feats = []
         
+        h, w = self.map_size
         norm_scale = max(h, w)
         
         for coord in node_coords:
@@ -501,41 +514,73 @@ class Env():
                              n_pos = self.node_coords[n_idx]
                              cv2.line(sim_img, (rx, ry), (int(n_pos[0]), int(n_pos[1])), (255, 255, 0), 1) # Cyan
 
-        # --- Panel 2: Entropy View ---
-        # Normalize
-        e_min = self.entropy_map.min()
-        e_max = self.entropy_map.max()
-        entropy_norm = (self.entropy_map - e_min) / (e_max - e_min + 1e-6)
-        entropy_norm = (entropy_norm * 255).astype(np.uint8)
-        entropy_img = cv2.applyColorMap(entropy_norm, cv2.COLORMAP_JET)
+        # --- Panel 2: Entropy View (Refactored) ---
+        # Visualize entropy of free regions (points)
+        entropy_img = np.zeros_like(base_img)
         
-        # Mask Unknown Areas (Background -> Black)
-        # Assuming robot_belief == 127 is Unknown
-        entropy_img[self.robot_belief == 127] = [0, 0, 0]
+        # Draw background (Unknown=Gray, Obstacle=Black, Free=White)
+        entropy_img[self.robot_belief == 255] = [255, 255, 255]
+        entropy_img[self.robot_belief == 1] = [0, 0, 0]
+        entropy_img[self.robot_belief == 127] = [127, 127, 127]
         
-        # Add Legend (Gradient Bar)
-        # Size: 30% of width, height 12px
+        # Calculate entropy for free nodes and colorize them
+        if self.node_coords is not None and len(self.node_coords) > 0:
+            # Re-calculate entropy features on demand for visualization
+            entropy_scores, _ = self.get_node_features(self.node_coords)
+            
+            for i, coord in enumerate(self.node_coords):
+                val = entropy_scores[i][0] # Scalar 0-1
+                
+                # Color Map: Blue (0.0) -> Green (0.5) -> Red (1.0)
+                if val <= 0.5:
+                    # Blue to Green
+                    ratio = val / 0.5
+                    b = int(255 * (1 - ratio))
+                    g = int(255 * ratio)
+                    r = 0
+                else:
+                    # Green to Red
+                    ratio = (val - 0.5) / 0.5
+                    b = 0
+                    g = int(255 * (1 - ratio))
+                    r = int(255 * ratio)
+                
+                color = (b, g, r)
+                
+                # Draw point with entropy color
+                cv2.circle(entropy_img, (int(coord[0]), int(coord[1])), 4, color, -1)
+        
+        # Robot Marker
+        cv2.circle(entropy_img, (rx, ry), 3, (255, 255, 255), -1)
+        
+        # Add Colorbar Legend
         leg_w = int(w * 0.4)
         leg_h = 12
         leg_pad = 10
         
-        # Gradient
-        grad = np.linspace(0, 255, leg_w).astype(np.uint8)
-        grad = np.tile(grad, (leg_h, 1))
-        grad_color = cv2.applyColorMap(grad, cv2.COLORMAP_JET)
-        
+        # Create gradient bar
+        grad_bar = np.zeros((leg_h, leg_w, 3), dtype=np.uint8)
+        for i in range(leg_w):
+            ratio = i / leg_w
+            if ratio <= 0.5:
+                sub_ratio = ratio / 0.5
+                b = int(255 * (1 - sub_ratio))
+                g = int(255 * sub_ratio)
+                r = 0
+            else:
+                sub_ratio = (ratio - 0.5) / 0.5
+                b = 0
+                g = int(255 * (1 - sub_ratio))
+                r = int(255 * sub_ratio)
+            grad_bar[:, i] = (b, g, r)
+            
         # Position: Bottom Right
         x_start = w - leg_w - leg_pad
-        y_start = h - leg_h - 25 # Leave space for text below
+        y_start = h - leg_h - 25
         
-        # Overlay
-        # Check bounds
         if y_start > 0 and x_start > 0:
-            entropy_img[y_start:y_start+leg_h, x_start:x_start+leg_w] = grad_color
-            
-        # Robot Marker
-        cv2.circle(entropy_img, (rx, ry), 3, (255, 255, 255), -1)
-
+            entropy_img[y_start:y_start+leg_h, x_start:x_start+leg_w] = grad_bar
+        
         # --- Panel 3: Semantic View ---
         sem_img = np.zeros_like(base_img)
         # Background: Dimmed Ground Truth
@@ -578,7 +623,7 @@ class Env():
         
         # Titles
         draw.text((10, 10), "仿真视角", font=self.title_font, fill=(255, 0, 0))
-        draw.text((w + 10, 10), "熵值热力图", font=self.title_font, fill=(255, 0, 0))
+        draw.text((w + 10, 10), "熵值热力图(蓝->红:熵增)", font=self.title_font, fill=(255, 0, 0))
         draw.text((2*w + 10, 10), "语义地图(绿:确认,红:发现)", font=self.title_font, fill=(255, 0, 0))
         
         # Entropy Legend Values
@@ -592,16 +637,16 @@ class Env():
         l_y_start = h - leg_h - 25
         l_y_text = l_y_start + leg_h + 2
         
-        # Draw Min/Max values (White text for contrast on black background)
-        if 'e_min' in locals() and 'e_max' in locals():
-            draw.text((l_x_start, l_y_text), f"{e_min:.2f}", font=self.legend_font, fill=(255, 255, 255))
-            max_str = f"{e_max:.2f}"
-            # Estimate width
-            try:
-                max_w = draw.textlength(max_str, font=self.legend_font)
-            except:
-                max_w = self.legend_font.getsize(max_str)[0]
-            draw.text((l_x_start + leg_w - max_w, l_y_text), max_str, font=self.legend_font, fill=(255, 255, 255))
+        # Draw Min/Max values (Removed)
+        # if 'e_min' in locals() and 'e_max' in locals():
+        #    draw.text((l_x_start, l_y_text), f"{e_min:.2f}", font=self.legend_font, fill=(255, 255, 255))
+        #    max_str = f"{e_max:.2f}"
+        #    # Estimate width
+        #    try:
+        #        max_w = draw.textlength(max_str, font=self.legend_font)
+        #    except:
+        #        max_w = self.legend_font.getsize(max_str)[0]
+        #    draw.text((l_x_start + leg_w - max_w, l_y_text), max_str, font=self.legend_font, fill=(255, 255, 255))
 
         # Info Text
         if info_text:
@@ -648,3 +693,4 @@ def get_frontier_in_map(map_data):
     if len(y) == 0:
         return np.zeros((0, 2))
     return np.stack([x, y], axis=1) # Return (x, y)
+

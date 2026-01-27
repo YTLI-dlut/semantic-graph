@@ -32,14 +32,89 @@ class Worker:
         self.blacklisted_frontiers = [] # List of (coords, expiry_step)
         self.position_history = [] # For oscillation detection
 
-
-
         self.episode_buffer = []
         self.perf_metrics = dict()
-        for i in range(17):
+        for i in range(30):
             self.episode_buffer.append([])
             
         self.total_semantic_gain = 0
+
+    def compute_best_heading(self, node_coords, neighbor_indices):
+        """
+        Compute Top-3 best heading indices (0-35) for each neighbor node.
+        Input:
+            node_coords: All node coordinates
+            neighbor_indices: Neighbor indices for current step [K_SIZE]
+        Output:
+            neighbor_best_headings: Tensor [1, K, 3] containing 0-35 indices
+        """
+        k_size = len(neighbor_indices)
+        neighbor_best_headings_list = []
+        
+        # Get all current frontiers
+        if len(self.env.frontiers) > 0:
+            frontiers = np.array(list(self.env.frontiers))
+        else:
+            frontiers = np.empty((0, 2))
+
+        num_angles_bin = NUM_ANGLES_BIN
+        sensor_range = self.env.sensor_range
+        fov = self.env.fov
+
+        for i in range(k_size):
+            node_idx = neighbor_indices[i]
+            # Handle padding (-1)
+            if node_idx == -1:
+                neighbor_best_headings_list.append([0] * NUM_HEADING_CANDIDATES)
+                continue
+
+            curr_node_pos = node_coords[node_idx]
+            
+            # Initialize scores
+            heading_scores = np.zeros(num_angles_bin)
+            
+            if len(frontiers) > 0:
+                # 1. Vectors from node to frontiers
+                diffs = frontiers - curr_node_pos
+                dists = np.linalg.norm(diffs, axis=1)
+                
+                # 2. Filter within sensor range
+                valid_mask = dists < sensor_range
+                valid_diffs = diffs[valid_mask]
+                
+                if len(valid_diffs) > 0:
+                    # 3. Relative angles (0 ~ 2pi)
+                    angles = np.arctan2(valid_diffs[:, 1], valid_diffs[:, 0])
+                    angles = (angles + 2*np.pi) % (2*np.pi)
+                    
+                    # 4. Map to Bins
+                    bin_indices = (angles / (2*np.pi) * num_angles_bin).astype(int)
+                    bin_indices = np.clip(bin_indices, 0, num_angles_bin - 1)
+                    
+                    # 5. Histogram
+                    np.add.at(heading_scores, bin_indices, 1)
+                    
+                    # 6. Smoothing (Convolution)
+                    window_size = int((fov / (2*np.pi)) * num_angles_bin) // 2
+                    if window_size > 0:
+                        kernel = np.ones(window_size)
+                        heading_scores = np.convolve(np.pad(heading_scores, window_size, mode='wrap'), kernel, mode='same')[window_size:-window_size]
+
+            # 7. Select Top-N
+            if np.sum(heading_scores) > 0:
+                top_indices = np.argsort(-heading_scores)[:NUM_HEADING_CANDIDATES]
+                # If fewer than N candidates (unlikely with smoothing but possible), pad with 0
+                if len(top_indices) < NUM_HEADING_CANDIDATES:
+                     padding = np.zeros(NUM_HEADING_CANDIDATES - len(top_indices), dtype=int)
+                     top_indices = np.concatenate((top_indices, padding))
+            else:
+                # Fallback: 0, 120, 240 degrees (indices)
+                # 36 bins -> 0, 12, 24
+                top_indices = np.array([0, 12, 24]) 
+                
+            neighbor_best_headings_list.append(top_indices)
+
+        return torch.LongTensor(np.array(neighbor_best_headings_list)).unsqueeze(0).to(self.device)
 
     def get_observations(self):
         # 1. Get raw graph data
@@ -55,25 +130,6 @@ class Worker:
 
         # ... Tensor processing ...
         n_nodes = node_coords.shape[0]
-        # In Single Agent, node_utility is (N, 1) or simplified.
-        # Parameter.py: INPUT_DIM = 3 + int(USE_C) + int(USE_GUIDEPOST) = 3+1+1 = 5
-        # node_coords (2) + utility (1) + guidepost (1) + ? 
-        # node_utility needs to be reshaped correctly.
-        # MAME originally: utility is [util, dist_r1, dist_r2...]
-        # Now we only need [util, dist_r1].
-        
-        # Re-calc utility vector here since graph_generator might still produce old format or we just fix shape
-        # In single agent, we treat node_utility just as [utility_value] usually, 
-        # plus maybe distance to self.
-        
-        # For simplicity, let's assume node_utility currently just holds value
-        # We need to manually append dist if needed, or rely on graph_generator doing it.
-        # graph_generator logic:
-        # if USE_K_FLAGS: append dists...
-        # else: append utility.
-        # logic in graph_generator: self.node_utility.append(utility) -> scalar.
-        
-        # So node_utility is (N,) scalar array if !USE_K_FLAGS
         
         node_utility = node_utility.reshape((n_nodes, 1))
         
@@ -106,14 +162,13 @@ class Worker:
         adjacent_matrix = self.calculate_edge_mask(edge_inputs)
         edge_mask = torch.from_numpy(adjacent_matrix).float().unsqueeze(0).to(self.device)
         
-        # Utility mask (Attention matrix) - simplified for single agent usually just ajancency
-        utility_mask = edge_mask # Or ones
+        # Utility mask (Attention matrix)
+        utility_mask = edge_mask 
 
         # Padding edges
         padding = torch.nn.ConstantPad2d(
             (0, self.node_padding_size - len(edge_inputs), 0, self.node_padding_size - len(edge_inputs)), 1)
         edge_mask = padding(edge_mask)
-        # utility_mask = padding(utility_mask) 
 
         edge = edge_inputs[current_node_index]
         # Clip to K_SIZE if data has more edges
@@ -125,17 +180,20 @@ class Worker:
 
         edge_inputs = torch.tensor(edge).unsqueeze(0).unsqueeze(0).to(self.device)
         
+        # New: Compute Best Headings
+        neighbor_best_headings = self.compute_best_heading(self.env.node_coords, edge)
+        
         edge_padding_mask = torch.zeros((1, 1, self.k_size), dtype=torch.int64).to(self.device)
         one = torch.ones_like(edge_padding_mask, dtype=torch.int64).to(self.device)
         edge_padding_mask = torch.where(edge_inputs == -1, one, edge_padding_mask)
         edge_inputs = torch.where(edge_inputs == -1, 0, edge_inputs)
 
         # Note: model expects 7 args usually
-        observations = node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, edge_mask # Using edge_mask as utility_mask for now
+        observations = node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, edge_mask, neighbor_best_headings 
         return observations
 
     def select_node(self, observations, curr_episode):
-        node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask = observations
+        node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask, neighbor_best_headings = observations
         
         # Random Exploration Phase
         if curr_episode < RANDOM_EXPLORE_EPOCHS:
@@ -145,11 +203,7 @@ class Worker:
             # --- A* Frontier Exploration Logic ---
             if USE_ASTAR_EXPLORATION:
                 # 0. Manage Blacklist
-                current_step = self.global_step if hasattr(self, 'global_step') else time.time() # Fallback if global_step static
-                # Actually global_step in worker is passed in init, might not update. Use time or local counter?
-                # Let's use time for simplicity in this context or just a counter.
-                # Since worker is re-created or persistent? It seems persistent.
-                # We can use a local step counter if global_step isn't updating per step here.
+                current_step = self.global_step if hasattr(self, 'global_step') else time.time()
                 if not hasattr(self, 'internal_step_counter'):
                     self.internal_step_counter = 0
                 self.internal_step_counter += 1
@@ -164,7 +218,6 @@ class Worker:
                 # Check for A-B-A pattern
                 is_oscillating = False
                 if len(self.position_history) >= 4:
-                    # Check if pos[t] ~= pos[t-2] and pos[t-1] ~= pos[t-3]
                     p_curr = self.position_history[-1]
                     p_prev = self.position_history[-2]
                     p_prev2 = self.position_history[-3]
@@ -174,20 +227,16 @@ class Worker:
                          is_oscillating = True
                 
                 if is_oscillating and self.current_frontier_target is not None:
-                    # Blacklist current target
                     self.blacklisted_frontiers.append((self.current_frontier_target, self.internal_step_counter + 100))
                     self.current_frontier_target = None
                     self.current_path = None
-                    self.position_history = [] # Reset history
+                    self.position_history = [] 
 
-                # 1. Update Target Logic with Hysteresis & Blacklisting
+                # 1. Update Target Logic
                 dist_to_target = float('inf')
-                
-                # Check if current target is still valid
                 target_valid = False
                 if self.current_frontier_target is not None:
                     dist_to_target = np.linalg.norm(self.env.robot_position - self.current_frontier_target)
-                    # Check if target is still in frontiers list (approximate match)
                     if len(self.env.frontiers) > 0:
                         dists_to_frontiers = np.linalg.norm(self.env.frontiers - self.current_frontier_target, axis=1)
                         if np.min(dists_to_frontiers) < 5.0: 
@@ -197,19 +246,14 @@ class Worker:
                     self.current_frontier_target = None
                     self.current_path = None
                 
-                # Check if reached (Close enough)
-                # If we are close to target (e.g. < 10.0), we assume we visited it.
-                # If it's still a frontier, it means we couldn't clear it (unreachable or sensor noise).
-                # Blacklist it to prevent immediate re-selection.
                 if self.current_frontier_target is not None and dist_to_target < 15.0:
-                    self.blacklisted_frontiers.append((self.current_frontier_target, self.internal_step_counter + 50)) # Blacklist for 50 steps
+                    self.blacklisted_frontiers.append((self.current_frontier_target, self.internal_step_counter + 50)) 
                     self.current_frontier_target = None
                     self.current_path = None
                 
-                # Re-select target if None
+                # Re-select target
                 if self.current_frontier_target is None:
                      if len(self.env.frontiers) > 0:
-                        # Filter out blacklisted
                         candidate_indices = []
                         for i, f in enumerate(self.env.frontiers):
                             is_blacklisted = False
@@ -226,7 +270,6 @@ class Worker:
                             min_idx = np.argmin(dists)
                             self.current_frontier_target = candidates[min_idx]
                         else:
-                            # If all blacklisted, just pick nearest of all
                             dists = np.linalg.norm(self.env.frontiers - self.env.robot_position, axis=1)
                             min_idx = np.argmin(dists)
                             self.current_frontier_target = self.env.frontiers[min_idx]
@@ -236,51 +279,34 @@ class Worker:
                         self.current_frontier_target = None
                         self.current_path = None
                 
-                # 2. Plan Path (with caching)
+                # 2. Plan Path
                 if self.current_frontier_target is not None:
-                    # Only re-plan if no path or path finished/invalid
                     need_replan = False
                     if self.current_path is None or len(self.current_path) == 0:
                         need_replan = True
-                    else:
-                        # Check if robot has deviated too far from path start (re-plan if so)
-                        # Or if path is blocked (check only next few steps for performance)
-                        # For now, let's just use the cached path and prune it based on current pos
-                        pass
 
                     if need_replan:
-                        # Prepare Map: 1=Obstacle, 0=Free
                         grid_map = (self.env.robot_belief == 1).astype(int)
-                        
-                        start_pos = (int(self.env.robot_position[1]), int(self.env.robot_position[0])) # y, x
-                        end_pos = (int(self.current_frontier_target[1]), int(self.current_frontier_target[0])) # y, x
-                        
+                        start_pos = (int(self.env.robot_position[1]), int(self.env.robot_position[0])) 
+                        end_pos = (int(self.current_frontier_target[1]), int(self.current_frontier_target[0])) 
                         path = astar(grid_map, start_pos, end_pos)
                         
                         if path is None:
-                            # Path planning failed (unreachable?), reset target to force re-selection
                             self.current_frontier_target = None
                             self.current_path = None
                         else:
                             self.current_path = path
 
-                    # 3. Follow Path (Lookahead)
+                    # 3. Follow Path
                     if self.current_path is not None and len(self.current_path) > 0:
-                        # Prune path: remove points that are "behind" us or too close
-                        # Find closest point on path to robot
-                        path_arr = np.array(self.current_path) # (N, 2) -> (y, x)
-                        # Convert to (x, y) for distance calc
+                        path_arr = np.array(self.current_path) 
                         path_xy = np.fliplr(path_arr) 
                         dists = np.linalg.norm(path_xy - self.env.robot_position, axis=1)
                         min_dist_idx = np.argmin(dists)
-                        
-                        # Update current path to start from closest point
-                        # But keep some history? No, just slice.
                         self.current_path = self.current_path[min_dist_idx:]
                         
-                        # Lookahead
-                        lookahead_dist = 30.0 # Lookahead distance
-                        target_point = self.current_path[-1] # Default to end
+                        lookahead_dist = 30.0 
+                        target_point = self.current_path[-1] 
                         
                         for i, pt in enumerate(self.current_path):
                              pt_xy = np.array([pt[1], pt[0]])
@@ -303,7 +329,7 @@ class Worker:
                             for idx in valid_indices:
                                 n_global_idx = edge_inputs[0, 0, idx].item()
                                 if n_global_idx == -1: continue
-                                if n_global_idx == curr_node_idx_val: continue # Skip self
+                                if n_global_idx == curr_node_idx_val: continue 
                                 
                                 n_pos = self.env.node_coords[n_global_idx]
                                 score = np.linalg.norm(n_pos - target_xy)
@@ -313,43 +339,45 @@ class Worker:
                                     best_idx = idx
                             
                             if best_idx is not None:
-                                # Local Minima Check
                                 current_dist_to_lookahead = np.linalg.norm(self.env.robot_position - target_xy)
                                 if best_score >= current_dist_to_lookahead:
-                                     # Moving moves us further away or same dist
                                      if current_dist_to_lookahead < 20.0:
-                                         # We are close to lookahead (which might be target)
-                                         # Consider target reached/stuck
                                          if self.current_frontier_target is not None:
                                              self.blacklisted_frontiers.append((self.current_frontier_target, self.internal_step_counter + 50))
                                              self.current_frontier_target = None
                                              self.current_path = None
-                                         # Stay
-                                         # Find action index for self or 0
-                                         # But we need to return valid action.
-                                         # If we return best_idx, we oscillate.
-                                         # If we reset target, next loop handles it.
                                          pass
                                      else:
-                                         # Far from target but stuck. Re-plan.
                                          self.current_path = None
 
-                                action_index = best_idx.unsqueeze(0)
+                                # --- New Action Logic ---
                                 n_global_idx = edge_inputs[0, 0, best_idx].item()
                                 n_pos = self.env.node_coords[n_global_idx]
                                 dx = n_pos[0] - self.env.robot_position[0]
                                 dy = n_pos[1] - self.env.robot_position[1]
                                 angle = np.arctan2(dy, dx) 
                                 if angle < 0: angle += 2*np.pi
-                                ori_discrete = int(round(angle / (np.pi/4))) % 8
-                                orientation_idx = torch.tensor([ori_discrete]).to(self.device)
+                                
+                                # Find best rank
+                                candidates_bins = neighbor_best_headings[0, best_idx] # (3,)
+                                candidates_angles = candidates_bins.float() * (2*np.pi / NUM_ANGLES_BIN)
+                                
+                                # Circular difference
+                                diffs = torch.abs(candidates_angles - angle)
+                                diffs = torch.min(diffs, 2*np.pi - diffs)
+                                rank = torch.argmin(diffs).item()
+                                
+                                action_index = best_idx * NUM_HEADING_CANDIDATES + rank
+                                orientation_idx = candidates_bins[rank]
+                                
+                                action_index = torch.tensor([action_index]).to(self.device)
+                                orientation_idx = orientation_idx.unsqueeze(0).to(self.device)
 
             if action_index is None:
                 # Fallback to Random
                 valid_mask = (edge_padding_mask == 0).squeeze() # (k_size)
                 valid_indices = torch.nonzero(valid_mask).flatten()
                 
-                # Filter out self-loop in fallback
                 curr_node_idx_val = current_index.item()
                 filtered_indices = []
                 for idx in valid_indices:
@@ -359,44 +387,50 @@ class Worker:
                 
                 if len(filtered_indices) > 0:
                     idx = torch.randint(0, len(filtered_indices), (1,)).item()
-                    action_index = filtered_indices[idx].unsqueeze(0) 
+                    best_idx = filtered_indices[idx]
                 else:
-                    # If absolutely no other choice, stay (or 0 if 0 is valid)
                     if len(valid_indices) > 0:
-                         action_index = valid_indices[0].unsqueeze(0)
+                         best_idx = valid_indices[0]
                     else:
-                         action_index = torch.tensor([0]).to(self.device)
-
-                # Random Orientation (Discrete 0-7)
-                orientation_idx = torch.randint(0, 8, (1,)).to(self.device)
+                         best_idx = torch.tensor(0).to(self.device)
+                
+                # Random Rank
+                rank = torch.randint(0, NUM_HEADING_CANDIDATES, (1,)).item()
+                action_index = best_idx * NUM_HEADING_CANDIDATES + rank
+                action_index = action_index.unsqueeze(0).to(self.device)
+                
+                orientation_idx = neighbor_best_headings[0, best_idx, rank].unsqueeze(0)
             
         else:
             # Model Prediction Phase
             with torch.no_grad():
-                logp_list, orientation_logits = self.local_policy_net(node_inputs, edge_inputs, current_index, node_padding_mask,
-                                                  edge_padding_mask, edge_mask, utility_mask, self.greedy)
+                # PolicyNet now returns logp for (K_SIZE * NUM_HEADING_CANDIDATES) actions
+                logp_list, _ = self.local_policy_net(node_inputs, edge_inputs, current_index, node_padding_mask,
+                                                  edge_padding_mask, edge_mask, utility_mask, neighbor_best_headings, self.greedy)
             
             if self.greedy:
-                action_index = torch.argmax(logp_list, dim=1).long()
-                orientation_idx = torch.argmax(orientation_logits, dim=1).long()
+                action_flat = torch.argmax(logp_list, dim=1).long()
             else:
-                action_index = torch.multinomial(logp_list.exp(), 1).long().squeeze(1)
-                # Sample from orientation logits
-                orientation_probs = torch.softmax(orientation_logits, dim=1)
-                orientation_idx = torch.multinomial(orientation_probs, 1).long().squeeze(1)
+                action_flat = torch.multinomial(logp_list.exp(), 1).long().squeeze(1)
+            
+            action_index = action_flat
+            
+            neighbor_idx = action_index.item() // NUM_HEADING_CANDIDATES
+            rank = action_index.item() % NUM_HEADING_CANDIDATES
+            orientation_idx = neighbor_best_headings[0, neighbor_idx, rank].unsqueeze(0)
         
-        next_node_index = edge_inputs[0, 0, action_index]
+        neighbor_idx = action_index.item() // NUM_HEADING_CANDIDATES
+        next_node_index = edge_inputs[0, 0, neighbor_idx]
         next_position = self.env.node_coords[next_node_index]
         
-        # Convert orientation index [0-7] to radians [0, 2pi)
-        # 0 -> 0, 1 -> pi/4, 2 -> pi/2, ...
-        target_orientation = orientation_idx.item() * (np.pi / 4.0)
+        # Convert orientation index [0-35] to radians [0, 2pi)
+        target_orientation = orientation_idx.item() * (2 * np.pi / NUM_ANGLES_BIN)
         
         return next_position, action_index, target_orientation, orientation_idx
 
     # ... save/load buffer ...
     def save_observations(self, observations):
-        node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask = observations
+        node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask, neighbor_best_headings = observations
         self.episode_buffer[0] += copy.deepcopy(node_inputs)
         self.episode_buffer[1] += copy.deepcopy(edge_inputs)
         self.episode_buffer[2] += copy.deepcopy(current_index)
@@ -404,16 +438,10 @@ class Worker:
         self.episode_buffer[4] += copy.deepcopy(edge_padding_mask).bool()
         self.episode_buffer[5] += copy.deepcopy(edge_mask).bool()
         self.episode_buffer[15] += copy.deepcopy(utility_mask).bool()
+        self.episode_buffer[18] += copy.deepcopy(neighbor_best_headings)
 
     def save_action(self, action_index, orientation_idx):
         self.episode_buffer[6] += action_index.unsqueeze(0).unsqueeze(0)
-        # Save orientation action (assume slot 16 or new one? buffer size is 17)
-        # buffer[15] and [16] were utility mask and next utility mask
-        # We need a new slot. Let's extend buffer size in __init__?
-        # Or reuse. Let's append to a new list. But episode_buffer is a list of lists.
-        # Let's add slot 17 for orientation.
-        if len(self.episode_buffer) < 18:
-            self.episode_buffer.append([]) # 17: orientation action
         self.episode_buffer[17] += orientation_idx.unsqueeze(0).unsqueeze(0)
 
     def save_reward_done(self, reward, done):
@@ -421,7 +449,7 @@ class Worker:
         self.episode_buffer[8] += copy.deepcopy(torch.tensor([[[(int(done))]]]).to(self.device))
 
     def save_next_observations(self, observations):
-        node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask = observations
+        node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask, neighbor_best_headings = observations
         self.episode_buffer[9] += copy.deepcopy(node_inputs)
         self.episode_buffer[10] += copy.deepcopy(edge_inputs)
         self.episode_buffer[11] += copy.deepcopy(current_index)
@@ -429,6 +457,7 @@ class Worker:
         self.episode_buffer[13] += copy.deepcopy(edge_padding_mask).bool()
         self.episode_buffer[14] += copy.deepcopy(edge_mask).bool()
         self.episode_buffer[16] += copy.deepcopy(utility_mask).bool()
+        self.episode_buffer[19] += copy.deepcopy(neighbor_best_headings)
 
     def run_episode(self, curr_episode):
         done = False
@@ -516,7 +545,13 @@ class Worker:
         self.perf_metrics['reward_repeat'] = self.env.last_rewards.get('repeat', 0)
 
         
-        self.perf_metrics['state_entropy'] = np.sum(self.env.entropy_map)
+        # self.perf_metrics['state_entropy'] = np.sum(self.env.entropy_map)
+        # Calculate entropy sum from nodes (Approximate global entropy)
+        if self.env.node_coords is not None and len(self.env.node_coords) > 0:
+            entropy_scores, _ = self.env.get_node_features(self.env.node_coords)
+            self.perf_metrics['state_entropy'] = np.sum(entropy_scores)
+        else:
+            self.perf_metrics['state_entropy'] = 0.0
         self.perf_metrics['state_frontiers'] = len(self.env.frontiers)
         self.perf_metrics['state_confirmed'] = len(self.env.found_semantics)
         self.perf_metrics['state_unconfirmed'] = len(self.env.get_unconfirmed_centers())
@@ -547,7 +582,9 @@ class Worker:
             images.append(imageio.imread(os.path.join(path, filename)))
             
         if len(images) > 0:
-            imageio.mimsave(f'{self.save_path}/episode_{episode}.gif', images, duration=0.1)
+            gif_path = f'{self.save_path}/episode_{episode}.gif'
+            imageio.mimsave(gif_path, images, duration=0.1)
+            print(f"GIF generated successfully: {gif_path}")
             # Optional: Clean up images
             if os.path.exists(path):
                 shutil.rmtree(path)

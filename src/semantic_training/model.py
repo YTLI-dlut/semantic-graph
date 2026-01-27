@@ -230,13 +230,13 @@ class PolicyNet(nn.Module):
 
         self.pointer = SingleHeadAttention(embedding_dim)
         
-        # Orientation Head (Discrete 8 directions)
-        # 0: 0°, 1: 45°, 2: 90°, ..., 7: 315°
-        self.orientation_head = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
-            nn.ReLU(),
-            nn.Linear(embedding_dim // 2, 8) # 8 class logits
-        )
+        # Heading Embedding (36 bins -> embedding_dim)
+        self.heading_embedding = nn.Embedding(NUM_ANGLES_BIN, embedding_dim)
+        
+        # Fusion layer to combine neighbor feature and heading feature
+        self.feature_fusion = nn.Linear(embedding_dim * 2, embedding_dim)
+        
+        # Removed orientation_head
 
     def encode_graph(self, node_inputs, node_padding_mask, edge_mask, utility_mask):
         node_feature = self.initial_embedding(node_inputs)
@@ -249,7 +249,7 @@ class PolicyNet(nn.Module):
 
         return enhanced_node_feature
 
-    def output_policy(self, enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy=False, return_attention_weights=False):
+    def output_policy(self, enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy=False, return_attention_weights=False, neighbor_best_headings=None):
         current_edge = edge_inputs.permute(0, 2, 1)
         
         embedding_dim = enhanced_node_feature.size()[2]
@@ -273,34 +273,60 @@ class PolicyNet(nn.Module):
         enhanced_current_node_feature, decoder_attention = self.decoder(current_node_feature, enhanced_node_feature, node_padding_mask)
         enhanced_current_node_feature = self.current_embedding(torch.cat((enhanced_current_node_feature, current_node_feature), dim=-1))
         
-        # Calculate Orientation Logits (Batch, 8)
-        orientation_logits = self.orientation_head(enhanced_current_node_feature).squeeze(1)
+        # --- New Logic for Relative Selection ---
+        if neighbor_best_headings is None:
+             # Should not happen in training, but for safety
+             raise ValueError("neighbor_best_headings required for output_policy")
+
+        batch_size, k_size, num_candidates = neighbor_best_headings.size()
+        
+        # Embed headings: (Batch, K, 3, Dim)
+        heading_features = self.heading_embedding(neighbor_best_headings)
+        
+        # Expand neighbor features: (Batch, K, 3, Dim)
+        neigboring_feature_expanded = neigboring_feature.unsqueeze(2).repeat(1, 1, num_candidates, 1)
+        
+        # Combine: (Batch, K, 3, 2*Dim)
+        combined = torch.cat((neigboring_feature_expanded, heading_features), dim=-1)
+        
+        # Fuse: (Batch, K, 3, Dim)
+        fused_features = self.feature_fusion(combined)
+        
+        # Flatten to (Batch, K*3, Dim) for Pointer Attention
+        fused_features_flat = fused_features.view(batch_size, k_size * num_candidates, embedding_dim)
+        
+        # Expand Mask: (Batch, 1, K) -> (Batch, 1, K*3)
+        if current_mask is not None:
+            # current_mask is (Batch, 1, K). 1 means masked (padding).
+            current_mask_expanded = current_mask.unsqueeze(-1).repeat(1, 1, 1, num_candidates).view(batch_size, 1, k_size * num_candidates)
+        else:
+            current_mask_expanded = None
 
         if return_attention_weights:
-            logp, pointer_attention = self.pointer(enhanced_current_node_feature, neigboring_feature, current_mask, return_attention_weights=True)
-            logp = logp.squeeze(1) # batch_size*k_size
+            logp, pointer_attention = self.pointer(enhanced_current_node_feature, fused_features_flat, current_mask_expanded, return_attention_weights=True)
+            logp = logp.squeeze(1) # batch_size*k_size*3
             attention_info = {
-                'pointer_attention': pointer_attention.squeeze(1),  # batch_size*k_size
-                'decoder_attention': decoder_attention,  # n_heads*batch_size*1*n_nodes
-                'node_importance': pointer_attention.squeeze(1).mean(dim=0)  # k_size, 平均注意力作为节点重要性
+                'pointer_attention': pointer_attention.squeeze(1), 
+                'decoder_attention': decoder_attention, 
+                'node_importance': pointer_attention.squeeze(1).view(batch_size, k_size, num_candidates).sum(dim=2).mean(dim=0)
             }
-            return logp, orientation_logits, attention_info
+            return logp, None, attention_info
         else:
-            logp = self.pointer(enhanced_current_node_feature, neigboring_feature, current_mask)
-            logp = logp.squeeze(1) # batch_size*k_size
-            return logp, orientation_logits
+            logp = self.pointer(enhanced_current_node_feature, fused_features_flat, current_mask_expanded)
+            logp = logp.squeeze(1) 
+            return logp, None
 
 
 
-    def forward(self, node_inputs, edge_inputs, current_index, node_padding_mask=None, edge_padding_mask=None, edge_mask=None, utility_mask=None, greedy=False, return_attention_weights=False):
+    def forward(self, node_inputs, edge_inputs, current_index, node_padding_mask=None, edge_padding_mask=None, edge_mask=None, utility_mask=None, neighbor_best_headings=None, greedy=False, return_attention_weights=False):
 
         enhanced_node_feature = self.encode_graph(node_inputs, node_padding_mask, edge_mask, utility_mask)
         
         if return_attention_weights:
-            logp, orientation_logits, attention_info = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, return_attention_weights=True)
+            logp, orientation_logits, attention_info = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, return_attention_weights=True, neighbor_best_headings=neighbor_best_headings)
             return logp, orientation_logits, attention_info
         else:
-            logp, orientation_logits = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy)
+            logp, orientation_logits = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, neighbor_best_headings=neighbor_best_headings)
             return logp, orientation_logits
 
 
@@ -317,7 +343,11 @@ class QNet(nn.Module):
             self.robot_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
         self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
 
-        self.q_values_layer = nn.Linear(embedding_dim, 8)
+        self.q_values_layer = nn.Linear(embedding_dim, 1) # Output 1 Q-value per action
+        
+        # Heading Embedding
+        self.heading_embedding = nn.Embedding(NUM_ANGLES_BIN, embedding_dim)
+        self.feature_fusion = nn.Linear(embedding_dim * 2, embedding_dim)
 
     def encode_graph(self, node_inputs, node_padding_mask, edge_mask, utility_mask):
         embedding_feature = self.initial_embedding(node_inputs)
@@ -329,7 +359,7 @@ class QNet(nn.Module):
 
         return embedding_feature
 
-    def output_q_values(self, enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask):
+    def output_q_values(self, enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, neighbor_best_headings=None):
         # k_size = edge_inputs.size()[2] // N_ROBOTS
         k_size = edge_inputs.size()[2]
         current_edge = edge_inputs
@@ -350,27 +380,51 @@ class QNet(nn.Module):
         if not ALLOW_STAY:
             current_mask[:, :, 0] = 1  # don't stay at current position
 
-        # if USE_ROBOT_ATTENTION:
-        #     enhanced_neigboring_feature = self.r_r_encoder(neigboring_feature)
-        #     neigboring_feature = self.r_r_embedding(torch.cat((enhanced_neigboring_feature, neigboring_feature), dim=-1))
-
-        action_features = torch.cat((enhanced_current_node_feature.repeat(1, k_size, 1), current_node_feature.repeat(1, k_size, 1), neigboring_feature), dim=-1)
-        action_features = self.action_embedding(action_features)
-        q_values = self.q_values_layer(action_features) # (batch_size/2) * k_size * 1
-        # print('q_values', q_values.size())
+        # --- New Logic ---
+        if neighbor_best_headings is None:
+             raise ValueError("neighbor_best_headings required for output_q_values")
         
-        #assert 0 in current_mask
-        current_mask = current_mask.permute(0, 2, 1)
-        # Use a large negative number for invalid actions instead of 0
-        # to avoid selecting them when Q-values are negative (e.g. penalties)
-        min_value = torch.tensor(-1e9).to(q_values.device)
-        q_values = torch.where(current_mask == 1, min_value, q_values)
+        batch_size, _, num_candidates = neighbor_best_headings.size()
+        
+        # Embed headings: (Batch, K, 3, Dim)
+        heading_features = self.heading_embedding(neighbor_best_headings)
+        
+        # Expand neighbor features: (Batch, K, 3, Dim)
+        neigboring_feature_expanded = neigboring_feature.unsqueeze(2).repeat(1, 1, num_candidates, 1)
+        
+        # Combine and Fuse: (Batch, K, 3, Dim)
+        fused_features = self.feature_fusion(torch.cat((neigboring_feature_expanded, heading_features), dim=-1))
+        
+        # Expand context features
+        enhanced_current_node_feature_expanded = enhanced_current_node_feature.repeat(1, k_size, 1).unsqueeze(2).repeat(1, 1, num_candidates, 1)
+        current_node_feature_expanded = current_node_feature.repeat(1, k_size, 1).unsqueeze(2).repeat(1, 1, num_candidates, 1)
+        
+        # Concatenate for Action Features: (Batch, K, 3, 3*Dim)
+        action_features = torch.cat((enhanced_current_node_feature_expanded, current_node_feature_expanded, fused_features), dim=-1)
+        
+        action_features = self.action_embedding(action_features)
+        q_values = self.q_values_layer(action_features) # (Batch, K, 3, 1)
+        
+        q_values = q_values.view(batch_size, k_size * num_candidates) # Flatten
+        
+        # Mask
+        if current_mask is not None:
+            current_mask = current_mask.permute(0, 2, 1) # (Batch, 1, K) -> (Batch, K, 1)? 
+            # Wait, edge_padding_mask in get_observations is (1, 1, K).
+            # Here current_mask = edge_padding_mask.
+            # permute(0, 2, 1) -> (1, K, 1).
+            # We want (Batch, K*3).
+            # Expand (Batch, K, 1) to (Batch, K, 3) then flatten.
+            current_mask_expanded = current_mask.repeat(1, 1, num_candidates).view(batch_size, k_size * num_candidates)
+            
+            min_value = torch.tensor(-1e9).to(q_values.device)
+            q_values = torch.where(current_mask_expanded == 1, min_value, q_values)
 
         return q_values, attention_weights
 
     def forward(self, node_inputs, edge_inputs, current_index, node_padding_mask=None, edge_padding_mask=None,
-                edge_mask=None, utility_mask=None):
+                edge_mask=None, utility_mask=None, neighbor_best_headings=None):
         enhanced_node_feature = self.encode_graph(node_inputs, node_padding_mask, edge_mask, utility_mask)
-        q_values, attention_weights = self.output_q_values(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask)
+        q_values, attention_weights = self.output_q_values(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, neighbor_best_headings=neighbor_best_headings)
         return q_values, attention_weights
 
