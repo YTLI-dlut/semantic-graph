@@ -188,54 +188,17 @@ class Env():
         
         self.old_frontiers = current_frontiers_set # Update for next step
         
-        # Entropy Reward (Removed as requested)
-        # current_total_entropy = np.sum(self.entropy_map)
-        # if not hasattr(self, 'last_total_entropy'):
-        #      self.last_total_entropy = self.map_size[0] * self.map_size[1]
-             
 
         reward = reward_explore
-        reward -= move_dist * 0.05 
+        # reward -= move_dist * 0.05 
         
         # Discovery Reward
         reward += self.new_seen_count * REWARD_NEW_SEEN
-
-        # Node Coverage Reward
-        # Track visited positions (quantized to 10 pixels ~ 0.5m)
-        q_pos = (int(self.robot_position[0] // 10), int(self.robot_position[1] // 10))
-        coverage_reward = 0.0
-        if q_pos not in self.visited_nodes:
-            self.visited_nodes.add(q_pos)
-            coverage_reward = 0.2
-            reward += coverage_reward
-            
-        # Repeat Penalty (Coverage Mechanism against staying still)
-        # History queue: self.pose_history = deque(maxlen=10)
-        # Format: (x, y, ori_idx)
-        repeat_penalty = 0.0
         
-        # Quantize current state for history matching
-        # Position: 10 pixels resolution, Orientation: 0.1 rad resolution
-        curr_state = (int(self.robot_position[0]), int(self.robot_position[1]), round(self.robot_orientation, 2))
-        
-        if not hasattr(self, 'pose_history'):
-            from collections import deque
-            self.pose_history = deque(maxlen=10)
-            
-        # Check match
-        if curr_state in self.pose_history:
-            repeat_penalty = REWARD_REPEAT_PENALTY
-            reward += repeat_penalty
-        
-        # Update history
-        self.pose_history.append(curr_state)
-
         # Store detailed rewards for metrics
         self.last_rewards = {
             "explore": reward_explore,
             "discovery": self.new_seen_count * REWARD_NEW_SEEN,
-            "coverage": coverage_reward,
-            "repeat": repeat_penalty
         }
         
         self.old_robot_belief = self.robot_belief.copy()

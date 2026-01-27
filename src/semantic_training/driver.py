@@ -21,6 +21,24 @@ def main():
     print(f"Log Path: {train_path}")
     print(f"GIFs Path: {gifs_path}")
 
+    # Validate Dataset Configuration
+    if train_mode:
+        print("Validating Dataset Configuration...")
+        if not os.path.exists(DATASET_EASY_PATH):
+            raise FileNotFoundError(f"Easy dataset not found at {DATASET_EASY_PATH}")
+        if not os.path.exists(DATASET_MEDIUM_PATH):
+            raise FileNotFoundError(f"Medium dataset not found at {DATASET_MEDIUM_PATH}")
+        if not os.path.exists(DATASET_HARD_PATH):
+            raise FileNotFoundError(f"Hard dataset not found at {DATASET_HARD_PATH}")
+        
+        # Check Epoch Logic
+        if DATASET_EASY_EPOCHS != DATASET_MEDIUM_START_EPOCH:
+            print("Warning: Gap or overlap between Easy and Medium epochs.")
+        if DATASET_MEDIUM_END_EPOCH != DATASET_HARD_START_EPOCH:
+            print("Warning: Gap or overlap between Medium and Hard epochs.")
+        
+        print("Dataset Configuration Validated.")
+
     # Tensorboard
     writer = SummaryWriter(train_path)
 
@@ -103,11 +121,27 @@ def main():
     print(f"Starting SAC training with {NUM_META_AGENT} meta agents...")
     
     try:
+        current_dataset_path = None
         while True:
+            # Determine Dataset
+            if curr_episode < DATASET_EASY_EPOCHS:
+                new_dataset_path = DATASET_EASY_PATH
+                stage_name = "EASY"
+            elif DATASET_MEDIUM_START_EPOCH <= curr_episode < DATASET_MEDIUM_END_EPOCH:
+                new_dataset_path = DATASET_MEDIUM_PATH
+                stage_name = "MEDIUM"
+            else:
+                new_dataset_path = DATASET_HARD_PATH
+                stage_name = "HARD"
+
+            if new_dataset_path != current_dataset_path:
+                print(f"[{time.strftime('%H:%M:%S')}] Switching to {stage_name} dataset: {new_dataset_path}")
+                current_dataset_path = new_dataset_path
+
             # Launch jobs
             job_list = []
             for i, meta_agent in enumerate(meta_agents):
-                job_list.append(meta_agent.job.remote(weights_set, curr_episode + i, gifs_path))
+                job_list.append(meta_agent.job.remote(weights_set, curr_episode + i, gifs_path, current_dataset_path))
             
             # Wait for results
             done_id, job_list = ray.wait(job_list, num_returns=NUM_META_AGENT)

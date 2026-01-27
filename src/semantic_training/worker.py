@@ -11,7 +11,7 @@ import time
 from astar_utils import astar
 
 class Worker:
-    def __init__(self, meta_agent_id, policy_net, q_net, global_step, device='cuda', greedy=False, save_image=False, save_path=None):
+    def __init__(self, meta_agent_id, policy_net, q_net, global_step, device='cuda', greedy=False, save_image=False, save_path=None, dataset_path=None):
         self.device = device
         self.greedy = greedy
         self.metaAgentID = meta_agent_id
@@ -20,8 +20,9 @@ class Worker:
         self.k_size = K_SIZE
         self.save_image = save_image
         self.save_path = save_path if save_path else gifs_path
+        self.dataset_path = dataset_path if dataset_path else "generated_data"
 
-        self.env = Env(map_index=self.global_step, k_size=self.k_size, plot=save_image)
+        self.env = Env(map_index=self.global_step, k_size=self.k_size, plot=save_image, data_dir=self.dataset_path)
         self.local_policy_net = policy_net
         self.local_q_net = q_net
         
@@ -539,10 +540,8 @@ class Worker:
         # Detailed Rewards & State Metrics
         self.perf_metrics['reward_explore'] = self.env.last_rewards.get('explore', 0)
         # self.perf_metrics['reward_entropy'] = self.env.last_rewards.get('entropy', 0) # Removed
-        self.perf_metrics['reward_discovery'] = self.env.last_rewards.get('discovery', 0)
         self.perf_metrics['reward_semantic'] = self.total_semantic_gain * REWARD_CONFIRM # Approx
         self.perf_metrics['reward_penalty'] = penalty # Last step penalty
-        self.perf_metrics['reward_repeat'] = self.env.last_rewards.get('repeat', 0)
 
         
         # self.perf_metrics['state_entropy'] = np.sum(self.env.entropy_map)

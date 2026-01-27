@@ -7,11 +7,19 @@ import time
 from datetime import datetime
 
 class MapGenerator:
-    def __init__(self, output_base_dir, num_scenes=500, map_size=(500, 500), resolution=0.05):
+    def __init__(self, output_base_dir, num_scenes=500, map_size=(500, 500), resolution=0.05,
+                 obj_size_range=(10, 20), min_obj_spacing=20, wall_padding=15, room_count_range=(3, 8)):
         self.output_base_dir = output_base_dir
         self.num_scenes = num_scenes
         self.map_size = map_size
         self.resolution = resolution
+        # Configuration for object generation
+        self.obj_size_range = obj_size_range   # (min, max) size in pixels
+        self.min_obj_spacing = min_obj_spacing # Minimum distance between objects
+        self.wall_padding = wall_padding       # Minimum distance from walls/corners
+        self.room_count_range = room_count_range # (min, max) number of rooms
+
+        
         self.categories = [
             {"name": "table", "color": "#8B4513"},
             {"name": "chair", "color": "#CD853F"},
@@ -40,7 +48,7 @@ class MapGenerator:
         
         # 1. Generate Rooms
         rooms = []
-        num_rooms = random.randint(3, 8)
+        num_rooms = random.randint(self.room_count_range[0], self.room_count_range[1])
         attempts = 0
         
         while len(rooms) < num_rooms and attempts < 100:
@@ -103,16 +111,38 @@ class MapGenerator:
             num_objs = random.randint(1, 3)
             for _ in range(num_objs):
                 cat = random.choice(self.categories)
-                obj_w = random.randint(10, 30)
-                obj_h = random.randint(10, 30)
+                
+                # 1. Reduce Object Size (Parameter: obj_size_range)
+                obj_w = random.randint(self.obj_size_range[0], self.obj_size_range[1])
+                obj_h = random.randint(self.obj_size_range[0], self.obj_size_range[1])
                 
                 # Try to place in room
-                for _ in range(10):
-                    ox = random.randint(room['x'] + 5, room['x'] + room['w'] - obj_w - 5)
-                    oy = random.randint(room['y'] + 5, room['y'] + room['h'] - obj_h - 5)
+                for _ in range(20): # Increased attempts for better placement
+                    # 2. Avoid Walls/Corners (Parameter: wall_padding)
+                    min_x = room['x'] + self.wall_padding
+                    max_x = room['x'] + room['w'] - obj_w - self.wall_padding
+                    min_y = room['y'] + self.wall_padding
+                    max_y = room['y'] + room['h'] - obj_h - self.wall_padding
                     
-                    # Check collision with existing objects
-                    if np.any(grid_sem[oy:oy+obj_h, ox:ox+obj_w] != -1):
+                    if min_x >= max_x or min_y >= max_y:
+                        continue # Room too small for padding constraints
+                        
+                    ox = random.randint(min_x, max_x)
+                    oy = random.randint(min_y, max_y)
+                    
+                    # 3. Avoid Clumping (Parameter: min_obj_spacing)
+                    # Check a larger box around the proposed object location
+                    check_x = max(0, ox - self.min_obj_spacing)
+                    check_y = max(0, oy - self.min_obj_spacing)
+                    check_w = obj_w + 2 * self.min_obj_spacing
+                    check_h = obj_h + 2 * self.min_obj_spacing
+                    
+                    # Ensure check bounds are within map
+                    check_x2 = min(self.map_size[1], check_x + check_w)
+                    check_y2 = min(self.map_size[0], check_y + check_h)
+                    
+                    # Check if any existing object is in this expanded area
+                    if np.any(grid_sem[check_y:check_y2, check_x:check_x2] != -1):
                         continue
                         
                     # Place Object
@@ -195,5 +225,17 @@ class MapGenerator:
         print(f"Completed! Generated {count} scenes.")
 
 if __name__ == "__main__":
-    generator = MapGenerator(output_base_dir="generated_data", num_scenes=500)
-    generator.run()
+    # Easy: 2-3 rooms
+    print("Generating Easy Dataset (2-3 rooms)...")
+    generator_easy = MapGenerator(output_base_dir="generated_data_easy", num_scenes=500, room_count_range=(2, 3))
+    generator_easy.run()
+
+    # Medium: 4-5 rooms
+    print("\nGenerating Medium Dataset (4-5 rooms)...")
+    generator_medium = MapGenerator(output_base_dir="generated_data_medium", num_scenes=500, room_count_range=(4, 5))
+    generator_medium.run()
+
+    # Hard: 6-8 rooms
+    print("\nGenerating Hard Dataset (6-8 rooms)...")
+    generator_hard = MapGenerator(output_base_dir="generated_data_hard", num_scenes=500, room_count_range=(6, 8))
+    generator_hard.run()

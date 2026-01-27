@@ -31,21 +31,21 @@ class Runner(object):
     def set_q_net_weights(self, weights1):
         self.local_q_net.load_state_dict(weights1)
 
-    def do_job(self, episode_number, save_path=None):
+    def do_job(self, episode_number, save_path=None, dataset_path=None):
         save_img = True if episode_number % SAVE_IMG_GAP == 0 else False
-        worker = Worker(self.meta_agent_id, self.local_network, self.local_q_net, episode_number, device=self.device, save_image=save_img, greedy=False, save_path=save_path)
+        worker = Worker(self.meta_agent_id, self.local_network, self.local_q_net, episode_number, device=self.device, save_image=save_img, save_path=save_path, dataset_path=dataset_path)
         worker.work(episode_number)
 
         job_results = worker.episode_buffer
         perf_metrics = worker.perf_metrics
         return job_results, perf_metrics
 
-    def job(self, weights_set, episode_number, save_path=None):
+    def job(self, weights_set, episode_number, save_path=None, dataset_path=None):
         print("starting episode {} on metaAgent {}".format(episode_number, self.meta_agent_id))
         self.set_policy_net_weights(weights_set[0])
         self.set_q_net_weights(weights_set[1])
 
-        job_results, metrics = self.do_job(episode_number, save_path)
+        job_results, metrics = self.do_job(episode_number, save_path, dataset_path)
 
         info = {
             "id": self.meta_agent_id,

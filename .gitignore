@@ -6,6 +6,9 @@ output/
 gifs/
 temp_vis_frames/
 models/
+/generated_data_easy/
+/generated_data_medium/
+/generated_data_hard/
 generated_data/
 log/
 /manual_maps

@@ -63,7 +63,6 @@ REWARD_EXPLORE_CELL = 0.1
 REWARD_NEW_SEEN = 5.0
 REWARD_DONE = 1000.0
 REWARD_STEP_PENALTY = -0.1
-REWARD_REPEAT_PENALTY = -0.5
 
 # SAC Parameters
 TAU = 0.005
@@ -83,6 +82,16 @@ GPU_MONITOR_INTERVAL = 100
 MODEL_SAVE_DIR = 'model_save'
 LOG_DIR = 'log'
 GIFS_DIR = 'gifs'
+
+# Dataset Curriculum Configuration
+DATASET_EASY_EPOCHS = 3000
+DATASET_MEDIUM_START_EPOCH = 3000
+DATASET_MEDIUM_END_EPOCH = 17000
+DATASET_HARD_START_EPOCH = 17000
+
+DATASET_EASY_PATH = 'generated_data_easy'
+DATASET_MEDIUM_PATH = 'generated_data_medium'
+DATASET_HARD_PATH = 'generated_data_hard'
 
 FOLDER_NAME = f'semantic_{time.strftime("%Y%m%d_%H%M%S")}'
 model_path = f'{MODEL_SAVE_DIR}/{FOLDER_NAME}'
