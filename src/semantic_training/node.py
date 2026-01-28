@@ -13,8 +13,6 @@ class Node():
         self.initialize_observable_frontiers(frontiers, robot_belief)
         self.utility = self.get_node_utility()
         self.clusters = self.get_node_clusters()
-        self.k_visit = [0 for i in range(N_ROBOTS)]
-        self.k_curr = [0 for i in range(N_ROBOTS)]
         if self.utility == 0:
             self.zero_utility_node = True
         else:

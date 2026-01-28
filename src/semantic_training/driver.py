@@ -56,7 +56,7 @@ def main():
     
     # 1. Global Networks (Actor & Twin Critics)
     # Distribute networks according to device map
-    input_dim = INPUT_DIM + int(USE_K_FLAGS) * N_ROBOTS
+    input_dim = INPUT_DIM
     global_policy_net = PolicyNet(input_dim, EMBEDDING_DIM).to(device_map['policy'])
     global_q_net1 = QNet(input_dim, EMBEDDING_DIM).to(device_map['q1'])
     global_q_net2 = QNet(input_dim, EMBEDDING_DIM).to(device_map['q2'])
@@ -155,44 +155,36 @@ def main():
                 job_results, metrics, info = result
                 metric_list.append(metrics)
                 
-                # job_results fields from worker.py:
-                # 0:node, 1:edge, 2:curr, 3:node_pad, 4:edge_pad, 5:edge_mask
-                # 6:action, 7:reward, 8:done
-                # 9:next_node, 10:next_edge, 11:next_curr, 12:next_node_pad, 13:next_edge_pad, 14:next_edge_mask
-                # 15:util_mask, 16:next_util_mask, 17:orientation
-                
                 length = len(job_results[0])
                 
-                for i in range(length):
-                    # Current State
-                    experience_buffer[0].append(job_results[0][i]) # node
-                    experience_buffer[1].append(job_results[1][i]) # edge
-                    experience_buffer[2].append(job_results[2][i]) # curr
-                    experience_buffer[3].append(job_results[3][i]) # node_pad
-                    experience_buffer[4].append(job_results[4][i]) # edge_pad
-                    experience_buffer[5].append(job_results[5][i]) # edge_mask
-                    experience_buffer[6].append(job_results[6][i]) # action
-                    experience_buffer[7].append(job_results[7][i]) # reward
-                    experience_buffer[8].append(job_results[8][i]) # done
-                    experience_buffer[15].append(job_results[15][i]) # util
-                    
-                    if len(job_results) > 17:
-                        experience_buffer[17].append(job_results[17][i]) # ori
-                    
-                    if len(job_results) > 18:
-                        experience_buffer[18].append(job_results[18][i]) # best_headings
+            for i in range(length):
+                # Current State (索引0-7)
+                experience_buffer[0].append(job_results[0][i])  # node_inputs
+                experience_buffer[1].append(job_results[1][i])  # edge_inputs
+                experience_buffer[2].append(job_results[2][i])  # current_index
+                experience_buffer[3].append(job_results[3][i])  # node_padding_mask
+                experience_buffer[4].append(job_results[4][i])  # edge_padding_mask
+                experience_buffer[5].append(job_results[5][i])  # edge_mask
+                experience_buffer[6].append(job_results[6][i])  # utility_mask
+                experience_buffer[7].append(job_results[7][i])  # neighbor_best_headings
 
-                    # Next State (Explicitly saved in worker.py)
-                    experience_buffer[20].append(job_results[9][i])
-                    experience_buffer[21].append(job_results[10][i])
-                    experience_buffer[22].append(job_results[11][i])
-                    experience_buffer[23].append(job_results[12][i])
-                    experience_buffer[24].append(job_results[13][i])
-                    experience_buffer[25].append(job_results[14][i])
-                    experience_buffer[26].append(job_results[16][i])
-                    
-                    if len(job_results) > 19:
-                        experience_buffer[27].append(job_results[19][i]) # next_best_headings
+                # Action (索引8-9)
+                experience_buffer[8].append(job_results[8][i])   # action_index
+                experience_buffer[9].append(job_results[9][i])   # orientation_idx
+
+                # Reward and Done (索引10-11)
+                experience_buffer[10].append(job_results[10][i])  # reward
+                experience_buffer[11].append(job_results[11][i])  # done
+
+                # Next State (索引12-19)
+                experience_buffer[12].append(job_results[12][i])  # next node_inputs
+                experience_buffer[13].append(job_results[13][i])  # next edge_inputs
+                experience_buffer[14].append(job_results[14][i])  # next current_index
+                experience_buffer[15].append(job_results[15][i])  # next node_padding_mask
+                experience_buffer[16].append(job_results[16][i])  # next edge_padding_mask
+                experience_buffer[17].append(job_results[17][i])  # next edge_mask
+                experience_buffer[18].append(job_results[18][i])  # next utility_mask
+                experience_buffer[19].append(job_results[19][i])  # next neighbor_best_headings
 
             # Trim Buffer
             if len(experience_buffer[0]) > REPLAY_SIZE:
@@ -216,7 +208,7 @@ def main():
                 gpu_manager.log_status()
             
             if buffer_size >= MINIMUM_BUFFER_SIZE:
-                updates_per_episode = 4 
+                updates_per_episode = 8 
                 
                 # Define helper for OOM safety
                 @GPUMemoryManager.safe_execution
@@ -230,20 +222,22 @@ def main():
                     b_node_pad = torch.stack([experience_buffer[3][j] for j in indices]).to(device)
                     b_edge_pad = torch.stack([experience_buffer[4][j] for j in indices]).to(device)
                     b_edge_mask = torch.stack([experience_buffer[5][j] for j in indices]).to(device)
-                    b_action = torch.stack([experience_buffer[6][j] for j in indices]).to(device)
-                    b_reward = torch.stack([experience_buffer[7][j] for j in indices]).to(device)
-                    b_done = torch.stack([experience_buffer[8][j] for j in indices]).to(device)
-                    b_util = torch.stack([experience_buffer[15][j] for j in indices]).to(device)
-                    b_best_headings = torch.stack([experience_buffer[18][j] for j in indices]).to(device)
-                    
-                    b_next_node = torch.stack([experience_buffer[20][j] for j in indices]).to(device)
-                    b_next_edge = torch.stack([experience_buffer[21][j] for j in indices]).to(device)
-                    b_next_curr = torch.stack([experience_buffer[22][j] for j in indices]).to(device)
-                    b_next_node_pad = torch.stack([experience_buffer[23][j] for j in indices]).to(device)
-                    b_next_edge_pad = torch.stack([experience_buffer[24][j] for j in indices]).to(device)
-                    b_next_edge_mask = torch.stack([experience_buffer[25][j] for j in indices]).to(device)
-                    b_next_util = torch.stack([experience_buffer[26][j] for j in indices]).to(device)
-                    b_next_best_headings = torch.stack([experience_buffer[27][j] for j in indices]).to(device)
+                    b_util = torch.stack([experience_buffer[6][j] for j in indices]).to(device)  # 修正：索引6是当前utility_mask
+                    b_best_headings = torch.stack([experience_buffer[7][j] for j in indices]).to(device)  # 修正：索引7是当前neighbor_best_headings
+
+                    b_action = torch.stack([experience_buffer[8][j] for j in indices]).to(device)  # 修正：索引8是action_index
+                    b_orientation = torch.stack([experience_buffer[9][j] for j in indices]).to(device)  # 新增：索引9是orientation_idx
+                    b_reward = torch.stack([experience_buffer[10][j] for j in indices]).to(device)  # 修正：索引10是reward
+                    b_done = torch.stack([experience_buffer[11][j] for j in indices]).to(device)  # 修正：索引11是done
+
+                    b_next_node = torch.stack([experience_buffer[12][j] for j in indices]).to(device)  # 修正：索引12是下一个node_inputs
+                    b_next_edge = torch.stack([experience_buffer[13][j] for j in indices]).to(device)  # 修正：索引13是下一个edge_inputs
+                    b_next_curr = torch.stack([experience_buffer[14][j] for j in indices]).to(device)  # 修正：索引14是下一个current_index
+                    b_next_node_pad = torch.stack([experience_buffer[15][j] for j in indices]).to(device)  # 修正：索引15是下一个node_padding_mask
+                    b_next_edge_pad = torch.stack([experience_buffer[16][j] for j in indices]).to(device)  # 修正：索引16是下一个edge_padding_mask
+                    b_next_edge_mask = torch.stack([experience_buffer[17][j] for j in indices]).to(device)  # 修正：索引17是下一个edge_mask
+                    b_next_util = torch.stack([experience_buffer[18][j] for j in indices]).to(device)  # 修正：索引18是下一个utility_mask
+                    b_next_best_headings = torch.stack([experience_buffer[19][j] for j in indices]).to(device)  # 修正：索引19是下一个neighbor_best_headings
                     
                     # Devices
                     dev_p = device_map['policy']
@@ -394,13 +388,11 @@ def main():
             # Perf Metrics
             avg_reward = np.mean([m.get("semantic_gain", 0) for m in metric_list])
             avg_dist = np.mean([m.get("travel_dist", 0) for m in metric_list])
-            avg_explored = np.mean([m.get("explored_rate", 0) for m in metric_list])
             
             print(f"[{time.strftime('%H:%M:%S')}] Episode {curr_episode}: "
-                  f"Avg Semantic Gain: {avg_reward:.2f}, Explored: {avg_explored:.2f}, Dist: {avg_dist:.2f}")
+                  f"Avg Semantic Gain: {avg_reward:.2f}, Dist: {avg_dist:.2f}")
             
             writer.add_scalar('Perf/SemanticGain', avg_reward, curr_episode)
-            writer.add_scalar('Perf/ExploredRate', avg_explored, curr_episode)
             writer.add_scalar('Perf/TravelDist', avg_dist, curr_episode)
             writer.add_scalar('Perf/SuccessRate', np.mean([m.get("success_rate", 0) for m in metric_list]), curr_episode)
             

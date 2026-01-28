@@ -14,8 +14,6 @@ class Runner(object):
         # If USE_K_FLAGS is false, we don't add N_ROBOTS factor.
         # Check parameter.py: INPUT_DIM = 3 + ...
         input_dim = INPUT_DIM
-        if USE_K_FLAGS:
-            input_dim += N_ROBOTS 
             
         self.local_network = PolicyNet(input_dim, EMBEDDING_DIM)
         self.local_q_net = QNet(input_dim, EMBEDDING_DIM)

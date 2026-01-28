@@ -86,8 +86,8 @@ class Env():
     def update_graph(self):
         self.frontiers = self.find_frontier()
         # Note: old_frontiers is updated in calculate_reward
-        self.node_coords, self.graph, self.node_utility, self.guidepost, self.node_k_flags = \
-            self.graph_generator.generate_graph([self.robot_position], self.robot_belief, self.frontiers, k_traj=[self.robot_path])
+        self.node_coords, self.graph, self.node_utility, self.guidepost = \
+            self.graph_generator.generate_graph(self.robot_position, self.robot_belief, self.frontiers, self.robot_path)
 
     def _find_valid_start_position(self):
         for _ in range(1000):
@@ -118,6 +118,8 @@ class Env():
         
         # Semantic Update
         new_semantics = self.update_semantic_status(next_position)
+
+        self.update_graph()
         
         return new_semantics, dist
 
@@ -193,7 +195,7 @@ class Env():
         # reward -= move_dist * 0.05 
         
         # Discovery Reward
-        reward += self.new_seen_count * REWARD_NEW_SEEN
+        # reward += self.new_seen_count * REWARD_NEW_SEEN
         
         # Store detailed rewards for metrics
         self.last_rewards = {
@@ -402,18 +404,13 @@ class Env():
         return entropy_feats, vector_feats
 
     def check_done(self):
-        # Done if no frontiers AND all seen semantics are confirmed
-        all_confirmed = (len(self.seen_semantics) > 0) and (self.seen_semantics == self.found_semantics)
-        # If no semantics seen yet, rely on frontiers. If seen, must confirm all.
-        # But logically, if frontiers=0, we explored everything reachable.
-        # So: Done = (Frontiers == 0) AND (All Seen Confirmed)
-        # However, if we can't reach the object (no frontiers), we might be stuck?
-        # Assuming reachable:
+        # if len(self.frontiers) == 0:
+        #     if len(self.seen_semantics) == 0:
+        #         self.done = True
+        #     elif self.seen_semantics == self.found_semantics:
+        #         self.done = True
         if len(self.frontiers) == 0:
-            if len(self.seen_semantics) == 0:
-                self.done = True
-            elif self.seen_semantics == self.found_semantics:
-                self.done = True
+            self.done = True
         return self.done
         
     def find_frontier(self):

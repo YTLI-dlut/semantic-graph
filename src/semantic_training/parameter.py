@@ -4,7 +4,7 @@ import os
 # MAME Parameter Configuration (Single Agent Refactor)
 
 REPLAY_SIZE = 10000
-MINIMUM_BUFFER_SIZE = 10000
+MINIMUM_BUFFER_SIZE = 1000
 BATCH_SIZE = 32
 EMBEDDING_DIM = 128
 
@@ -35,21 +35,14 @@ STAY_STILL_PENALTY = -0.500
 
 # Single Agent Settings
 N_ROBOTS = 1 
-USE_ROBOT_ATTENTION = False # Disabled for single agent
-USE_SEQUENCE_POLICY = False # No need for sequential decision making among robots
-USE_K_FLAGS = False
 
 # Features
-USE_C = 0
 ALLOW_STAY = True
-INTERSECTFRONTIER = False
-USE_COLLISION = False
-USE_TRANS = True
 USE_GUIDEPOST = True
-USE_ENTROPY = True
 USE_UNCONFIRMED_VECTOR = True
 
-INPUT_DIM = 3 + int(USE_C) + int(USE_GUIDEPOST) + int(USE_ENTROPY) + 2 * int(USE_UNCONFIRMED_VECTOR)
+#node_coords, node_utility, guidepost, entropy_feats, vector_feats 2 1 1 1 2
+INPUT_DIM = 2 + 1 + int(USE_GUIDEPOST) + 1 + 2 * int(USE_UNCONFIRMED_VECTOR)
 IOU_LAMBDA = 0.05
 train_mode = True
 
@@ -58,15 +51,15 @@ ENTROPY_UNCONFIRMED_BOOST = 2.0
 ENTROPY_BOOST_RADIUS = 30  # pixels
 
 # Reward Weights
-REWARD_CONFIRM = 50.0
-REWARD_EXPLORE_CELL = 0.1
+REWARD_CONFIRM = 10.0
+REWARD_EXPLORE_CELL = 0.5
 REWARD_NEW_SEEN = 5.0
-REWARD_DONE = 1000.0
+REWARD_DONE = 100.0
 REWARD_STEP_PENALTY = -0.1
 
 # SAC Parameters
 TAU = 0.005
-ALPHA = 0.2
+ALPHA = 0.02
 TARGET_ENTROPY_SCALE = 0.2
 
 # GPU Load Balancing

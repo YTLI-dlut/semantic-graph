@@ -219,10 +219,7 @@ class PolicyNet(nn.Module):
         self.previous_downsample = nn.Linear(embedding_dim * 2, embedding_dim)
         self.previous_trans = Decoder(embedding_dim=embedding_dim, n_head=4, n_layer=3)
         self.previous_down = nn.Linear(embedding_dim * 2, embedding_dim)
-        self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6 if not USE_ROBOT_ATTENTION else 6)
-        if USE_ROBOT_ATTENTION:
-            self.robot_encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6 if not USE_ROBOT_ATTENTION else 6)
-            self.robot_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
+        self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6)
         self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
         # self.r_r_encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
         
@@ -242,10 +239,6 @@ class PolicyNet(nn.Module):
         node_feature = self.initial_embedding(node_inputs)
         # print("mask",node_feature.shape, node_padding_mask.shape)
         enhanced_node_feature = self.encoder(src=node_feature, key_padding_mask=node_padding_mask, attn_mask=edge_mask)
-        if USE_ROBOT_ATTENTION:
-            attention_node_feature = self.robot_encoder(src=node_feature, key_padding_mask=node_padding_mask, attn_mask=utility_mask)
-            enhanced_node_feature = self.robot_embedding(torch.cat((enhanced_node_feature, attention_node_feature), dim=-1))
-            enhanced_node_feature = nn.ReLU()(enhanced_node_feature)
 
         return enhanced_node_feature
 
@@ -255,21 +248,18 @@ class PolicyNet(nn.Module):
         embedding_dim = enhanced_node_feature.size()[2]
         # print("current_edge", current_edge.size())
         neigboring_feature = torch.gather(enhanced_node_feature, 1, current_edge.repeat(1, 1, embedding_dim))
-        # print(neigboring_feature.size())
-        # print(current_index.size())
+
         current_node_feature = torch.gather(enhanced_node_feature, 1, current_index.repeat(1, 1, embedding_dim))
-        # print(current_node_feature.size())
+
         if edge_padding_mask is not None:
             current_mask = edge_padding_mask
-            # print(current_mask)
+
         else:
             current_mask = None
 
         if not ALLOW_STAY:
             current_mask[:, :, 0] = 1  # don't stay at current position
 
-        #assert 0 in current_mask
-        # print('current_node_feature', current_node_feature.size(), 'enhanced_node_feature', enhanced_node_feature.size(), 'node_padding_mask', node_padding_mask.size())
         enhanced_current_node_feature, decoder_attention = self.decoder(current_node_feature, enhanced_node_feature, node_padding_mask)
         enhanced_current_node_feature = self.current_embedding(torch.cat((enhanced_current_node_feature, current_node_feature), dim=-1))
         
@@ -337,10 +327,7 @@ class QNet(nn.Module):
         self.action_embedding = nn.Linear(embedding_dim*3, embedding_dim)
         # self.r_r_encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
         # self.r_r_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
-        self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6 if not USE_ROBOT_ATTENTION else 6)
-        if USE_ROBOT_ATTENTION:
-            self.robot_encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6 if not USE_ROBOT_ATTENTION else 6)
-            self.robot_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
+        self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6)
         self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
 
         self.q_values_layer = nn.Linear(embedding_dim, 1) # Output 1 Q-value per action
@@ -352,11 +339,6 @@ class QNet(nn.Module):
     def encode_graph(self, node_inputs, node_padding_mask, edge_mask, utility_mask):
         embedding_feature = self.initial_embedding(node_inputs)
         embedding_feature = self.encoder(src=embedding_feature, key_padding_mask=node_padding_mask, attn_mask=edge_mask)
-        if USE_ROBOT_ATTENTION:
-            attention_node_feature = self.robot_encoder(src=embedding_feature, key_padding_mask=node_padding_mask, attn_mask=utility_mask)
-            embedding_feature = self.robot_embedding(torch.cat((embedding_feature, attention_node_feature), dim=-1))
-            embedding_feature = nn.ReLU()(embedding_feature)
-
         return embedding_feature
 
     def output_q_values(self, enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, neighbor_best_headings=None):

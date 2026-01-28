@@ -128,15 +128,14 @@ class Worker:
         map_h, map_w = self.env.map_size
         node_coords = node_coords / max(map_h, map_w)
         node_utility = node_utility / 50.0
-
         # ... Tensor processing ...
         n_nodes = node_coords.shape[0]
         
         node_utility = node_utility.reshape((n_nodes, 1))
-        
+
         # New Features: Entropy & Unconfirmed Object Vector
         entropy_feats, vector_feats = self.env.get_node_features(self.env.node_coords)
-        
+
         node_inputs = np.concatenate((node_coords, node_utility, guidepost, entropy_feats, vector_feats), axis=1)
         node_inputs = torch.FloatTensor(node_inputs).unsqueeze(0).to(self.device)
 
@@ -145,6 +144,7 @@ class Worker:
         padding = torch.nn.ZeroPad2d((0, 0, 0, self.node_padding_size - node_coords.shape[0]))
         node_inputs = padding(node_inputs)
 
+        
         node_padding_mask = torch.zeros((1, 1, node_coords.shape[0]), dtype=torch.int64).to(self.device)
         node_padding = torch.ones((1, 1, self.node_padding_size - node_coords.shape[0]), dtype=torch.int64).to(self.device)
         node_padding_mask = torch.cat((node_padding_mask, node_padding), dim=-1)
@@ -188,7 +188,6 @@ class Worker:
         one = torch.ones_like(edge_padding_mask, dtype=torch.int64).to(self.device)
         edge_padding_mask = torch.where(edge_inputs == -1, one, edge_padding_mask)
         edge_inputs = torch.where(edge_inputs == -1, 0, edge_inputs)
-
         # Note: model expects 7 args usually
         observations = node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, edge_mask, neighbor_best_headings 
         return observations
@@ -438,26 +437,26 @@ class Worker:
         self.episode_buffer[3] += copy.deepcopy(node_padding_mask).bool()
         self.episode_buffer[4] += copy.deepcopy(edge_padding_mask).bool()
         self.episode_buffer[5] += copy.deepcopy(edge_mask).bool()
-        self.episode_buffer[15] += copy.deepcopy(utility_mask).bool()
-        self.episode_buffer[18] += copy.deepcopy(neighbor_best_headings)
+        self.episode_buffer[6] += copy.deepcopy(utility_mask).bool()
+        self.episode_buffer[7] += copy.deepcopy(neighbor_best_headings)
 
     def save_action(self, action_index, orientation_idx):
-        self.episode_buffer[6] += action_index.unsqueeze(0).unsqueeze(0)
-        self.episode_buffer[17] += orientation_idx.unsqueeze(0).unsqueeze(0)
+        self.episode_buffer[8] += action_index.unsqueeze(0).unsqueeze(0)
+        self.episode_buffer[9] += orientation_idx.unsqueeze(0).unsqueeze(0)
 
     def save_reward_done(self, reward, done):
-        self.episode_buffer[7] += copy.deepcopy(torch.FloatTensor([[[reward]]]).to(self.device))
-        self.episode_buffer[8] += copy.deepcopy(torch.tensor([[[(int(done))]]]).to(self.device))
+        self.episode_buffer[10] += copy.deepcopy(torch.FloatTensor([[[reward]]]).to(self.device))
+        self.episode_buffer[11] += copy.deepcopy(torch.tensor([[[(int(done))]]]).to(self.device))
 
     def save_next_observations(self, observations):
         node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, utility_mask, neighbor_best_headings = observations
-        self.episode_buffer[9] += copy.deepcopy(node_inputs)
-        self.episode_buffer[10] += copy.deepcopy(edge_inputs)
-        self.episode_buffer[11] += copy.deepcopy(current_index)
-        self.episode_buffer[12] += copy.deepcopy(node_padding_mask).bool()
-        self.episode_buffer[13] += copy.deepcopy(edge_padding_mask).bool()
-        self.episode_buffer[14] += copy.deepcopy(edge_mask).bool()
-        self.episode_buffer[16] += copy.deepcopy(utility_mask).bool()
+        self.episode_buffer[12] += copy.deepcopy(node_inputs)
+        self.episode_buffer[13] += copy.deepcopy(edge_inputs)
+        self.episode_buffer[14] += copy.deepcopy(current_index)
+        self.episode_buffer[15] += copy.deepcopy(node_padding_mask).bool()
+        self.episode_buffer[16] += copy.deepcopy(edge_padding_mask).bool()
+        self.episode_buffer[17] += copy.deepcopy(edge_mask).bool()
+        self.episode_buffer[18] += copy.deepcopy(utility_mask).bool()
         self.episode_buffer[19] += copy.deepcopy(neighbor_best_headings)
 
     def run_episode(self, curr_episode):
@@ -488,8 +487,6 @@ class Worker:
             
             new_semantics_count, dist = self.env.step(next_position, target_orientation)
             
-            # Update graph (using safe map internal to env)
-            self.env.update_graph()
 
             reward_explore = self.env.calculate_reward(dist)
             reward_semantic = new_semantics_count * REWARD_CONFIRM
@@ -509,6 +506,7 @@ class Worker:
             reward_done = REWARD_DONE if done else 0.0
 
             total_reward = reward_explore + reward_semantic + penalty + reward_done + REWARD_STEP_PENALTY
+            total_reward /= 50;
             self.total_semantic_gain += new_semantics_count
 
             if self.save_image:

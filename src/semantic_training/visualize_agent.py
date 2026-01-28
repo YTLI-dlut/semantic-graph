@@ -42,8 +42,6 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     input_dim = INPUT_DIM
-    if USE_K_FLAGS:
-        input_dim += N_ROBOTS
         
     policy_net = PolicyNet(input_dim, EMBEDDING_DIM).to(device)
     
