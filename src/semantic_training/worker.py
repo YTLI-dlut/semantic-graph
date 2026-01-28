@@ -35,7 +35,7 @@ class Worker:
 
         self.episode_buffer = []
         self.perf_metrics = dict()
-        for i in range(30):
+        for i in range(20):
             self.episode_buffer.append([])
             
         self.total_semantic_gain = 0
