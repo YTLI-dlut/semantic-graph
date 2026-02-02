@@ -12,7 +12,7 @@ class SingleHeadAttention(nn.Module):
         self.embedding_dim = embedding_dim
         self.value_dim = embedding_dim
         self.key_dim = self.value_dim
-        self.tanh_clipping = 10
+        # self.tanh_clipping = 10  # [Deleted] 彻底移除
         self.norm_factor = 1 / math.sqrt(self.key_dim)
 
         self.w_query = nn.Parameter(torch.Tensor(self.input_dim, self.key_dim))
@@ -26,7 +26,6 @@ class SingleHeadAttention(nn.Module):
             param.data.uniform_(-stdv, stdv)
 
     def forward(self, q, k, mask=None, return_attention_weights=False):
-
         n_batch, n_key, n_dim = k.size()
         n_query = q.size(1)
 
@@ -40,19 +39,31 @@ class SingleHeadAttention(nn.Module):
         K = torch.matmul(k_flat, self.w_key).view(shape_k)
 
         U = self.norm_factor * torch.matmul(Q, K.transpose(1, 2))
-        U = self.tanh_clipping * torch.tanh(U)
-
-        if mask is not None:
-            U = U.masked_fill(mask == 1, -1e8)
         
+        # [关键修复] 显式处理 Mask
+        if mask is not None:
+            # 1. 确保 mask 是布尔类型 (防止 int64/float32 比较失败)
+            if mask.dtype != torch.bool:
+                # 假设 mask 中 1 是无效，0 是有效
+                bool_mask = mask > 0.5 
+            else:
+                bool_mask = mask
+            
+            # 2. 打印调试信息 (仅在第一次运行时，或者你怀疑出错时打开)
+            # if torch.rand(1).item() < 0.01: # 随机抽样打印
+            #     print(f"[Attention DEBUG] U shape: {U.shape}, Mask shape: {bool_mask.shape}")
+            #     print(f"[Attention DEBUG] Mask sum: {bool_mask.sum().item()}")
+
+            # 3. 应用极小的负数
+            U = U.masked_fill(bool_mask, -1e9)
+
         # 保存原始注意力权重用于可视化
         attention_weights = torch.softmax(U, dim=-1) if return_attention_weights else None
-        attention = torch.log_softmax(U, dim=-1)  # n_batch*n_query*n_key
+        attention = torch.log_softmax(U, dim=-1)
 
         if return_attention_weights:
             return attention, attention_weights
         return attention
-
 
 # standard multi head attention layer
 class MultiHeadAttention(nn.Module):
@@ -214,11 +225,7 @@ class PolicyNet(nn.Module):
         super(PolicyNet, self).__init__()
         self.initial_embedding = nn.Linear(input_dim, embedding_dim) # layer for non-end position
         self.current_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
-        # self.r_r_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
-        self.previous_embedding = nn.Conv2d(1, 1, (N_ROBOTS, 1))
-        self.previous_downsample = nn.Linear(embedding_dim * 2, embedding_dim)
-        self.previous_trans = Decoder(embedding_dim=embedding_dim, n_head=4, n_layer=3)
-        self.previous_down = nn.Linear(embedding_dim * 2, embedding_dim)
+
         self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6)
         self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
         # self.r_r_encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
@@ -243,6 +250,7 @@ class PolicyNet(nn.Module):
         return enhanced_node_feature
 
     def output_policy(self, enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy=False, return_attention_weights=False, neighbor_best_headings=None):
+        
         current_edge = edge_inputs.permute(0, 2, 1)
         
         embedding_dim = enhanced_node_feature.size()[2]
@@ -257,8 +265,8 @@ class PolicyNet(nn.Module):
         else:
             current_mask = None
 
-        if not ALLOW_STAY:
-            current_mask[:, :, 0] = 1  # don't stay at current position
+        # if not ALLOW_STAY:
+        #     current_mask[:, :, 0] = 1  # don't stay at current position
 
         enhanced_current_node_feature, decoder_attention = self.decoder(current_node_feature, enhanced_node_feature, node_padding_mask)
         enhanced_current_node_feature = self.current_embedding(torch.cat((enhanced_current_node_feature, current_node_feature), dim=-1))
@@ -292,32 +300,83 @@ class PolicyNet(nn.Module):
         else:
             current_mask_expanded = None
 
-        if return_attention_weights:
-            logp, pointer_attention = self.pointer(enhanced_current_node_feature, fused_features_flat, current_mask_expanded, return_attention_weights=True)
-            logp = logp.squeeze(1) # batch_size*k_size*3
-            attention_info = {
-                'pointer_attention': pointer_attention.squeeze(1), 
-                'decoder_attention': decoder_attention, 
-                'node_importance': pointer_attention.squeeze(1).view(batch_size, k_size, num_candidates).sum(dim=2).mean(dim=0)
-            }
-            return logp, None, attention_info
-        else:
-            logp = self.pointer(enhanced_current_node_feature, fused_features_flat, current_mask_expanded)
-            logp = logp.squeeze(1) 
-            return logp, None
+        logp = self.pointer(enhanced_current_node_feature, fused_features_flat, current_mask_expanded)
+        logp = logp.squeeze(1) 
+        return logp
 
 
 
-    def forward(self, node_inputs, edge_inputs, current_index, node_padding_mask=None, edge_padding_mask=None, edge_mask=None, utility_mask=None, neighbor_best_headings=None, greedy=False, return_attention_weights=False):
+    def forward(self, node_inputs, edge_inputs, current_index, node_padding_mask=None, edge_padding_mask=None, edge_mask=None, utility_mask=None, neighbor_best_headings=None, greedy=False):
 
+# # --- DEBUG START: 完整打印所有输入 ---
+#         # 设置打印选项：不折叠(threshold=inf)，行宽设大一点避免换行过多(linewidth=2000)
+#         import sys
+#         torch.set_printoptions(profile="full", linewidth=2000, threshold=float('inf'))
+        
+#         print("\n" + "="*50)
+#         print(">>> PolicyNet Forward Input Debug <<<")
+#         print("="*50)
+
+#         # 1. node_inputs
+#         print(f"\n[node_inputs] Shape: {node_inputs.shape}")
+#         print(node_inputs)
+
+#         # 2. edge_inputs
+        # print(f"\n[edge_inputs] Shape: {edge_inputs.shape}")
+        # print(edge_inputs)
+
+#         # 3. current_index
+#         print(f"\n[current_index] Shape: {current_index.shape}")
+#         print(current_index)
+
+#         # 4. node_padding_mask
+#         if node_padding_mask is not None:
+#             print(f"\n[node_padding_mask] Shape: {node_padding_mask.shape}")
+#             print(node_padding_mask)
+#         else:
+#             print("\n[node_padding_mask] is None")
+
+#         # 5. edge_padding_mask
+        # if edge_padding_mask is not None:
+        #     print(f"\n[edge_padding_mask] Shape: {edge_padding_mask.shape}")
+        #     print(edge_padding_mask)
+        # else:
+        #     print("\n[edge_padding_mask] is None")
+
+#         # 6. edge_mask (Attention Mask)
+#         if edge_mask is not None:
+#             print(f"\n[edge_mask] Shape: {edge_mask.shape}")
+#             print(edge_mask)
+#         else:
+#             print("\n[edge_mask] is None")
+
+#         # 7. utility_mask
+#         if utility_mask is not None:
+#             print(f"\n[utility_mask] Shape: {utility_mask.shape}")
+#             print(utility_mask)
+#         else:
+#             print("\n[utility_mask] is None")
+
+#         # 8. neighbor_best_headings (重要特征)
+#         if neighbor_best_headings is not None:
+#             print(f"\n[neighbor_best_headings] Shape: {neighbor_best_headings.shape}")
+#             print(neighbor_best_headings)
+#         else:
+#             print("\n[neighbor_best_headings] is None")
+
+#         # 9. Booleans
+#         print(f"\n[Flags] greedy: {greedy}, return_attention_weights: {return_attention_weights}")
+        
+#         print("="*50 + "\n")
+        
+#         # 记得把打印设置还原，否则控制台后面可能会被刷屏
+#         # torch.set_printoptions(profile="default") 
+#         # --- DEBUG END ---
+#         assert 0
         enhanced_node_feature = self.encode_graph(node_inputs, node_padding_mask, edge_mask, utility_mask)
         
-        if return_attention_weights:
-            logp, orientation_logits, attention_info = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, return_attention_weights=True, neighbor_best_headings=neighbor_best_headings)
-            return logp, orientation_logits, attention_info
-        else:
-            logp, orientation_logits = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, neighbor_best_headings=neighbor_best_headings)
-            return logp, orientation_logits
+        logp = self.output_policy(enhanced_node_feature, edge_inputs, current_index, edge_padding_mask, node_padding_mask, greedy, neighbor_best_headings=neighbor_best_headings)
+        return logp
 
 
 class QNet(nn.Module):
@@ -325,8 +384,7 @@ class QNet(nn.Module):
         super(QNet, self).__init__()
         self.initial_embedding = nn.Linear(input_dim, embedding_dim) # layer for non-end position
         self.action_embedding = nn.Linear(embedding_dim*3, embedding_dim)
-        # self.r_r_encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
-        # self.r_r_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
+
         self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6)
         self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
 
@@ -359,8 +417,8 @@ class QNet(nn.Module):
             current_mask = edge_padding_mask
         else:
             current_mask = None
-        if not ALLOW_STAY:
-            current_mask[:, :, 0] = 1  # don't stay at current position
+        # if not ALLOW_STAY:
+        #     current_mask[:, :, 0] = 1  # don't stay at current position
 
         # --- New Logic ---
         if neighbor_best_headings is None:
@@ -399,8 +457,8 @@ class QNet(nn.Module):
             # Expand (Batch, K, 1) to (Batch, K, 3) then flatten.
             current_mask_expanded = current_mask.repeat(1, 1, num_candidates).view(batch_size, k_size * num_candidates)
             
-            min_value = torch.tensor(-1e9).to(q_values.device)
-            q_values = torch.where(current_mask_expanded == 1, min_value, q_values)
+            zero = torch.zeros_like(q_values).to(q_values.device)
+            q_values = torch.where(current_mask_expanded == 1, zero, q_values)
 
         return q_values, attention_weights
 

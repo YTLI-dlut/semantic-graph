@@ -9,6 +9,7 @@ from env import Env
 from parameter import *
 import time
 from astar_utils import astar
+import matplotlib.pyplot as plt
 
 class Worker:
     def __init__(self, meta_agent_id, policy_net, q_net, global_step, device='cuda', greedy=False, save_image=False, save_path=None, dataset_path=None):
@@ -188,6 +189,7 @@ class Worker:
         one = torch.ones_like(edge_padding_mask, dtype=torch.int64).to(self.device)
         edge_padding_mask = torch.where(edge_inputs == -1, one, edge_padding_mask)
         edge_inputs = torch.where(edge_inputs == -1, 0, edge_inputs)
+
         # Note: model expects 7 args usually
         observations = node_inputs, edge_inputs, current_index, node_padding_mask, edge_padding_mask, edge_mask, edge_mask, neighbor_best_headings 
         return observations
@@ -477,9 +479,53 @@ class Worker:
             # Single Agent: No loop over robots
             observations = self.get_observations()
             self.save_observations(observations)
+            if torch.all(observations[4]):
+                print(f"Agent {self.metaAgentID}: Spawned/Moved to dead end. Ending episode.")
+                break
+            # # === 在这里插入可视化代码 ===
+            # # 取出 node_inputs (observations 的第一个元素)
+            # node_inputs_tensor = observations[0] 
             
+            # # 为了不每一步都存，可以加个判断，比如每10步存一次，或者只在特定 Episode 存
+            # if True: 
+            #     debug_path = f'{self.save_path}/debug_episode_{curr_episode}'
+            #      # 取出 node_inputs (它是 observations 的第0个元素)
+            #     # self.debug_plot_separate(observations[0], i, debug_path)
+            #     self.visualize_observations(observations, i, debug_path)
+            # # ==========================
+
+
             next_position, action_index, target_orientation, orientation_idx = self.select_node(observations, curr_episode)
             self.save_action(action_index, orientation_idx)
+
+            # ================= [DEBUG START: 动作显微镜] =================
+            # 解码动作：Action ID = Neighbor_Idx * 3 + Heading_Rank
+            # neighbor_idx = action_index.item() // NUM_HEADING_CANDIDATES
+            # heading_rank = action_index.item() % NUM_HEADING_CANDIDATES
+            
+            # # 获取目标点的全局 ID (从 observation 的 edge_inputs 里取)
+            # # observations[1] is edge_inputs: (1, 1, K)
+            # target_node_global_id = observations[1][0, 0, neighbor_idx].item()
+            
+            # # 计算这一步想走多远
+            # dist_to_target = np.linalg.norm(next_position - self.env.robot_position)
+            
+            # print(f"\n--- [Step {i}] Action Diagnosis ---")
+            # print(f"Raw Action Index : {action_index.item()}")
+            # print(f"  |__ Neighbor   : Index {neighbor_idx} (Global Node {target_node_global_id})")
+            # print(f"  |__ Heading    : Rank {heading_rank}")
+            # print(f"Position Check   :")
+            # print(f"  |__ Robot Curr : {self.env.robot_position}")
+            # print(f"  |__ Target Pos : {next_position}")
+            # print(f"  |__ Distance   : {dist_to_target:.6f}")
+            
+            # if dist_to_target < 1e-4:
+            #     print("⚠️ [ALERT] 智能体选择了原地不动 (Stay)！")
+            # elif neighbor_idx == 0:
+            #      print("ℹ️ [INFO] 智能体选择了第0个邻居 (通常是自己或最近点)")
+            
+            # print("-" * 40)
+            # ================= [DEBUG END] =================
             
             # Record State for Penalty
             prev_pos = self.env.robot_position.copy()
@@ -501,11 +547,12 @@ class Worker:
             if dist_moved < 1e-3 and ori_diff < 1e-3:
                 penalty = STAY_STILL_PENALTY
                 # print(f"Ep {curr_episode} Step {i}: Penalty Triggered! Reward += {penalty}")
-
+            penalty += REWARD_STEP_PENALTY
             done = self.env.check_done()
             reward_done = REWARD_DONE if done else 0.0
 
-            total_reward = reward_explore + reward_semantic + penalty + reward_done + REWARD_STEP_PENALTY
+            # total_reward = reward_explore + reward_semantic + penalty + reward_done + REWARD_STEP_PENALTY
+            total_reward = reward_explore + penalty + reward_done
             total_reward /= 50;
             self.total_semantic_gain += new_semantics_count
 
@@ -513,18 +560,43 @@ class Worker:
                  path = f'{self.save_path}/episode_{curr_episode}'
                  info_text = f"步骤: {i} | 回合: {curr_episode}\n"
                  info_text += f"阶段: {phase_str}\n"
-                 info_text += f"总奖励: {total_reward:.2f} (探索: {reward_explore:.2f}, 语义: {reward_semantic:.2f}, 惩罚: {penalty:.2f}, 完成: {reward_done:.2f})\n"
+                 info_text += f"总奖励: {total_reward * 50:.2f} (探索: {reward_explore:.2f}, 语义: {reward_semantic:.2f}, 惩罚: {penalty:.2f}, 完成: {reward_done:.2f})\n"
                  info_text += f"已确认: {len(self.env.found_semantics)} | 已发现: {len(self.env.seen_semantics)}\n"
-                 ori_deg = np.degrees(target_orientation)
-                 ori_idx = orientation_idx.item()
-                 info_text += f"动作: 移动->Node{action_index.item()} | 角度->Idx{ori_idx}({ori_deg:.1f}°)"
+                #  ori_deg = np.degrees(target_orientation)
+                #  ori_idx = orientation_idx.item()
+                #  info_text += f"动作: 移动->Node{next_position} | 角度->Idx{ori_idx}({ori_deg:.1f}° | {action_index.item()})"
+                 # === 修改这一部分 ===
+                 neighbor_idx = action_index.item() // NUM_HEADING_CANDIDATES
+                 heading_rank = action_index.item() % NUM_HEADING_CANDIDATES
+                 target_node_id = observations[1][0, 0, neighbor_idx].item()
+                 
+                 info_text += f"Action: {action_index.item()} = N[{neighbor_idx}] + H[{heading_rank}]\n"
+                 info_text += f"Move: Node {target_node_id} (Dist: {np.linalg.norm(next_position - self.env.robot_position):.2f})"
+                 # ===================
                  self.env.plot_env(self.global_step, path, i, info_text=info_text)
             
             self.save_reward_done(total_reward, done)
             
-            observations = self.get_observations() # Next state
-            self.save_next_observations(observations)
-
+            observations_next = self.get_observations()
+            
+            # === [熔断检查 2] 下一步是死路？(关键！) ===
+            # 如果下一状态全是 Mask，Target Q 计算会 NaN，必须丢弃这一步数据
+            if torch.all(observations_next[4]):
+                # print(f"Agent {self.metaAgentID}: Next state is dead end. Discarding last transition.")
+                
+                # [回滚操作]：把刚才存进去的 s, a, r 全部吐出来
+                # 我们在本 Step 依次调用了：
+                # save_observations (存了 8 个 Tensor: indices 0-7)
+                # save_action (存了 2 个 Tensor: indices 8-9)
+                # save_reward_done (存了 2 个 Tensor: indices 10-11)
+                # 总共 12 个，必须全部 pop 掉，保证 Buffer 长度对齐
+                for idx in range(12):
+                    self.episode_buffer[idx].pop()
+                
+                # 遇到死路，直接结束本回合
+                break
+                
+            self.save_next_observations(observations_next)
             if done:
                 break
 
@@ -598,3 +670,250 @@ class Worker:
                     cnt += 1
             # assert cnt <= K_SIZE
         return bias_matrix
+
+
+
+    def debug_plot_separate(self, node_inputs, step_idx, path):
+            """
+            分图绘制 Node Inputs 的指标。
+            左图：Entropy (关注熵是否正确计算)
+            右图：Utility (关注效用值)
+            """
+            import matplotlib.pyplot as plt
+            import cv2
+            
+            # --- 1. 数据解析 ---
+            if isinstance(node_inputs, torch.Tensor):
+                data = node_inputs.cpu().detach().numpy()
+            else:
+                data = node_inputs
+            
+            # 去掉 batch 维度，确保是 (N, 7)
+            if data.ndim == 4: data = data[0, 0]
+            elif data.ndim == 3: data = data[0]
+
+            # --- 2. 准备底图 (Map) ---
+            # 复用 Env 的地图逻辑 (白:Free, 黑:Obs, 灰:Unknown)
+            h, w = self.env.map_size
+            map_img = np.zeros((h, w, 3), dtype=np.uint8)
+            map_img[self.env.robot_belief == 255] = [255, 255, 255]
+            map_img[self.env.robot_belief == 1] = [0, 0, 0]
+            map_img[self.env.robot_belief == 127] = [127, 127, 127]
+            
+            # Matplotlib 显示图片需要 RGB，OpenCV 默认也是构建的 RGB numpy 数组这里没问题
+            
+            # --- 3. 创建画布 (1行2列) ---
+            fig, axes = plt.subplots(1, 2, figsize=(24, 12), dpi=100)
+            norm_scale = max(h, w)
+            
+            # 定义要画的两个指标配置
+            # (标题, 特征在node_inputs里的索引, 颜色条名称, 文本颜色)
+            plots_config = [
+                ("Entropy (Is it catching Frontiers?)", 4, "Reds", "darkred"), # index 4 is Entropy
+                ("Utility (Is it guiding movement?)", 2, "Blues", "darkblue")  # index 2 is Utility
+            ]
+
+            # 获取有效节点 (过滤掉 padding 的 0,0 坐标)
+            valid_mask = (data[:, 0] != 0) | (data[:, 1] != 0)
+            valid_nodes = data[valid_mask]
+            
+            # --- 4. 循环绘制两个子图 ---
+            for ax, (title, feat_idx, cmap_name, text_color) in zip(axes, plots_config):
+                # A. 显示地图背景
+                ax.imshow(map_img, origin='upper') # origin='upper' 匹配图像坐标系
+                
+                # B. 画 Frontiers (作为参考真值，用显眼的红叉)
+                if len(self.env.frontiers) > 0:
+                    ax.scatter(self.env.frontiers[:, 0], self.env.frontiers[:, 1], 
+                            c='red', marker='x', s=30, label='Frontier (Truth)', zorder=2)
+
+                # C. 画 Robot (蓝色圆点)
+                ax.scatter(self.env.robot_position[0], self.env.robot_position[1], 
+                        c='cyan', s=100, edgecolors='k', label='Robot', zorder=5)
+
+                # D. 画 Nodes (散点图，颜色深浅代表数值大小)
+                if len(valid_nodes) > 0:
+                    node_x = valid_nodes[:, 0] * norm_scale
+                    node_y = valid_nodes[:, 1] * norm_scale
+                    values = valid_nodes[:, feat_idx]
+                    
+                    # 散点图
+                    sc = ax.scatter(node_x, node_y, c=values, cmap=cmap_name, 
+                                    s=80, edgecolors='black', zorder=3, vmin=0, vmax=1.0)
+                    plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+
+                    # E. 标注数值 (只标当前指标)
+                    for i in range(len(node_x)):
+                        val = values[i]
+                        # 只有当数值大于 0.01 时才显示，避免 0 值挤满屏幕
+                        if val > 0.01:
+                            ax.text(node_x[i]+2, node_y[i]-2, f"{val:.2f}", 
+                                    color=text_color, fontsize=9, fontweight='bold', zorder=4)
+                
+                ax.set_title(f"{title} - Step {step_idx}", fontsize=16)
+                ax.legend(loc='upper right')
+                # 隐藏坐标轴刻度，只看图
+                ax.axis('off')
+
+            plt.tight_layout()
+            
+            # --- 5. 保存 ---
+            if not os.path.exists(path):
+                os.makedirs(path)
+            save_file = os.path.join(path, f'debug_split_step_{step_idx:04d}.png')
+            plt.savefig(save_file)
+            plt.close(fig)
+            # print(f"Saved: {save_file}")
+
+    def visualize_observations(self, observations, step_idx, path):
+            """
+            全能可视化：Entropy, Utility, 以及 Graph Structure (Edges & Current Pos)
+            observations: get_observations() 返回的 tuple
+            """
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import os
+            import torch
+
+            # --- 1. 解包数据 (全部转为 Numpy) ---
+            # observations 结构: 
+            # 0:node_inputs, 1:edge_inputs, 2:current_index, 3:node_padding_mask, 
+            # 4:edge_padding_mask, 5:edge_mask, 6:utility_mask, 7:best_headings
+            
+            def to_np(t):
+                if isinstance(t, torch.Tensor):
+                    return t.cpu().detach().numpy()
+                return t
+
+            node_inputs = to_np(observations[0])   # (1, 1, N, 7) or (1, N, 7)
+            local_edges = to_np(observations[1])   # (1, 1, K_SIZE)
+            curr_idx_ts = to_np(observations[2])   # (1, 1, 1)
+            adj_mask    = to_np(observations[5])   # (1, N, N) or (1, 1, N, N)
+
+            # 处理 Node Data 维度
+            if node_inputs.ndim == 4: 
+                nodes_data = node_inputs[0, 0]
+            elif node_inputs.ndim == 3:
+                nodes_data = node_inputs[0]
+            else:
+                nodes_data = node_inputs
+
+            curr_node_idx = int(curr_idx_ts.flatten()[0])
+            
+            # 处理 Adjacency Matrix 维度 (修复了这里)
+            if adj_mask.ndim == 4: 
+                full_adj = adj_mask[0, 0]
+            elif adj_mask.ndim == 3:
+                full_adj = adj_mask[0]
+            else:
+                full_adj = adj_mask
+
+            # 处理 Local Edges 维度
+            if local_edges.ndim == 3: 
+                neighbors = local_edges[0, 0]
+            elif local_edges.ndim == 2:
+                neighbors = local_edges[0]
+            else:
+                neighbors = local_edges
+
+            # --- 2. 准备底图 ---
+            h, w = self.env.map_size
+            map_img = np.zeros((h, w, 3), dtype=np.uint8)
+            map_img[self.env.robot_belief == 255] = [255, 255, 255]
+            map_img[self.env.robot_belief == 1] = [0, 0, 0]
+            map_img[self.env.robot_belief == 127] = [127, 127, 127]
+            
+            # --- 3. 创建画布 (1行3列) ---
+            fig, axes = plt.subplots(1, 3, figsize=(30, 10), dpi=100)
+            norm_scale = max(h, w)
+            
+            # 过滤有效节点
+            valid_mask = (nodes_data[:, 0] != 0) | (nodes_data[:, 1] != 0)
+            valid_indices = np.where(valid_mask)[0]
+            
+            node_coords = nodes_data[:, :2] * norm_scale
+            
+            # === 图1 & 图2: Entropy 和 Utility ===
+            plots_config = [
+                (axes[0], "Entropy (Channel 4)", 4, "Reds", "darkred"),
+                (axes[1], "Utility (Channel 2)", 2, "Blues", "darkblue")
+            ]
+            
+            for ax, title, feat_idx, cmap, text_c in plots_config:
+                ax.imshow(map_img, origin='upper')
+                ax.scatter(self.env.frontiers[:, 0], self.env.frontiers[:, 1], c='red', marker='x', s=30, label='Frontiers')
+                
+                # 画节点
+                if len(valid_indices) > 0:
+                    sc = ax.scatter(node_coords[valid_indices, 0], node_coords[valid_indices, 1], 
+                                    c=nodes_data[valid_indices, feat_idx], cmap=cmap, 
+                                    s=60, edgecolors='k', vmin=0, vmax=1.0, zorder=3)
+                    plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                    
+                    # 写数值
+                    for i in valid_indices:
+                        val = nodes_data[i, feat_idx]
+                        if val > 0.01:
+                            ax.text(node_coords[i, 0]+2, node_coords[i, 1]-2, f"{val:.2f}", 
+                                    color=text_c, fontsize=8, fontweight='bold', zorder=4)
+                
+                # 画机器人当前位置
+                rx, ry = self.env.robot_position
+                ax.scatter(rx, ry, c='cyan', s=100, edgecolors='k', marker='*', label='Robot Pos', zorder=5)
+                ax.set_title(title)
+                ax.axis('off')
+
+            # === 图3: Connectivity (Graph Structure) ===
+            ax = axes[2]
+            ax.imshow(map_img, origin='upper')
+            ax.set_title(f"Connectivity & Actions\nCurrent Node: {curr_node_idx}")
+            
+            # A. 画全图连接 (Edge Mask) - 灰色细线
+            # full_adj[i, j] == 0 表示 i 和 j 相连
+            N = len(nodes_data)
+            for i in valid_indices:
+                for j in valid_indices:
+                    if i < j: 
+                        # 确保是标量比较
+                        is_connected = full_adj[i, j]
+                        if isinstance(is_connected, np.ndarray):
+                            is_connected = is_connected.item()
+                        
+                        if is_connected == 0: 
+                            p1 = node_coords[i]
+                            p2 = node_coords[j]
+                            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], c='gray', alpha=0.3, linewidth=0.5, zorder=1)
+
+            # B. 画当前节点 (高亮)
+            if curr_node_idx < N:
+                curr_pos = node_coords[curr_node_idx]
+                ax.scatter(curr_pos[0], curr_pos[1], c='lime', s=150, edgecolors='k', marker='o', label='Current Node', zorder=4)
+                # 机器人连线
+                rx, ry = self.env.robot_position
+                ax.plot([rx, curr_pos[0]], [ry, curr_pos[1]], 'g--', alpha=0.5)
+
+            # C. 画可选动作 (Edge Inputs) - 蓝色粗线
+            for n_idx in neighbors:
+                n_idx = int(n_idx)
+                if n_idx != -1 and n_idx < N:
+                    target_pos = node_coords[n_idx]
+                    ax.arrow(curr_pos[0], curr_pos[1], 
+                            target_pos[0]-curr_pos[0], target_pos[1]-curr_pos[1], 
+                            color='blue', width=0.5, head_width=2, length_includes_head=True, zorder=2)
+                    ax.text(target_pos[0], target_pos[1], str(n_idx), color='blue', fontsize=8)
+
+            # D. 画其他节点
+            ax.scatter(node_coords[valid_indices, 0], node_coords[valid_indices, 1], c='white', edgecolors='gray', s=30, zorder=2)
+            ax.scatter(self.env.frontiers[:, 0], self.env.frontiers[:, 1], c='red', marker='x', s=20, alpha=0.5)
+            
+            ax.legend(loc='upper right')
+            ax.axis('off')
+
+            plt.tight_layout()
+            
+            # --- 保存 ---
+            if not os.path.exists(path):
+                os.makedirs(path)
+            save_file = os.path.join(path, f'debug_full_step_{step_idx:04d}.png')
+            plt.savefig(save_file)
+            plt.close(fig)

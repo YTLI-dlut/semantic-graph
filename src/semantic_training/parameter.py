@@ -24,11 +24,11 @@ GAMMA = 1
 DECAY_STEP = 256
 SUMMARY_WINDOW = 5
 LOAD_MODEL = False
-LOAD_MODEL_PATH = '/home/iiau/createGraph_ws/model_save/semantic_20260126_215244/sac_checkpoint_2100.pth'
+LOAD_MODEL_PATH = '/home/iiau/createGraph_ws/model_save/semantic_20260202_130039/checkpoint.pth'
 SAVE_IMG_GAP = 100
 
 # Training Control
-RANDOM_EXPLORE_EPOCHS = 50
+RANDOM_EXPLORE_EPOCHS = 30
 USE_ASTAR_EXPLORATION = True # Use A* based frontier exploration in early epochs
 MAX_EPISODE_STEPS = 350
 STAY_STILL_PENALTY = -0.500
@@ -77,8 +77,8 @@ LOG_DIR = 'log'
 GIFS_DIR = 'gifs'
 
 # Dataset Curriculum Configuration
-DATASET_EASY_EPOCHS = 3000
-DATASET_MEDIUM_START_EPOCH = 3000
+DATASET_EASY_EPOCHS = 8000
+DATASET_MEDIUM_START_EPOCH = 8000
 DATASET_MEDIUM_END_EPOCH = 17000
 DATASET_HARD_START_EPOCH = 17000
 

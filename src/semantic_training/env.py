@@ -192,7 +192,7 @@ class Env():
         
 
         reward = reward_explore
-        # reward -= move_dist * 0.05 
+        reward -= move_dist * 0.05 
         
         # Discovery Reward
         # reward += self.new_seen_count * REWARD_NEW_SEEN
